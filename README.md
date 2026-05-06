@@ -31,16 +31,16 @@ The numpad `+`, `-`, and `*` keys also work.
 
 Download the latest zip from the release page:
 
-[Enshrouded Minimap v0.4.45](https://github.com/elxokker/Enshrouded-minimap/releases/tag/v0.4.45)
+[Enshrouded Minimap v0.4.46](https://github.com/elxokker/Enshrouded-minimap/releases/tag/v0.4.46)
 
 Release asset:
 
-`enshrouded-minimap-v0.4.45.zip`
+`enshrouded-minimap-v0.4.46.zip`
 
 ## Installing the Zip
 
 1. Close Enshrouded.
-2. Download `enshrouded-minimap-v0.4.45.zip`.
+2. Download `enshrouded-minimap-v0.4.46.zip`.
 3. Extract the zip.
 4. Copy the full `minimap_mod` folder to:
 
@@ -91,7 +91,7 @@ Example:
       "active": true,
       "position": "bottom-right",
       "toggle_key": "F10",
-      "render_camera_fallback": false,
+      "render_camera_fallback": true,
       "debug_logging": false,
       "map_sample_step": 2,
       "max_icons": 64
@@ -104,6 +104,10 @@ The mod also reads `mods.minimap_mod.toggle_key` every second while active.
 Recommended value: `F10`. Supported readable values include `F1`-`F24`,
 `insert`, `delete`, `home`, `end`, `pageup`, `pagedown`, `backspace`, and
 `numpad-*`.
+
+`render_camera_fallback` is enabled by default. It lets the minimap recover its
+player position from render data when a game update stops the normal UI position
+feed from firing before the minimap draws.
 
 The mod reads these values directly and refreshes them every second while active.
 If the minimap is not loaded yet, start or restart the game after changing it.
@@ -162,7 +166,7 @@ Install to a custom Enshrouded path:
 
 ## Version
 
-Current mod version: `0.4.45`.
+Current mod version: `0.4.46`.
 
 The mod resolves hook signatures near the known Enshrouded client addresses at
 load time, which makes small game updates less likely to break the minimap.

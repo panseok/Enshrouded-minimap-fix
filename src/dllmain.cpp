@@ -1131,7 +1131,7 @@ namespace
     ModMetaData g_metaData = {
         "minimap_mod",
         "Internal minimap data bridge for Enshrouded. No external overlay window.",
-        "0.4.45",
+        "0.4.46",
         "OpenAI + xoker",
         "0.0.3",
         true,
@@ -1214,7 +1214,7 @@ namespace
     std::atomic<int> g_minimapZoomStep{ 0 };
     std::atomic<bool> g_minimapVisible{ true };
     std::atomic<int> g_minimapToggleKey{ VK_F10 };
-    std::atomic<bool> g_renderCameraFallbackEnabled{ false };
+    std::atomic<bool> g_renderCameraFallbackEnabled{ true };
     std::atomic<bool> g_debugLoggingEnabled{ false };
     std::atomic<int> g_minimapMapSampleStep{ MINIMAP_DEFAULT_MAP_SAMPLE_STEP };
     std::atomic<int> g_minimapMaxDrawnPoints{ MINIMAP_DEFAULT_MAX_DRAWN_POINTS };
@@ -1486,7 +1486,7 @@ namespace
             toggleKeySource = "shroudtopia_config_api";
         }
 
-        std::string configuredRenderFallback = "false";
+        std::string configuredRenderFallback = "true";
         std::string renderFallbackSource = "default";
         if (!TryReadMinimapConfigStringFromFile(modContext, "render_camera_fallback", configuredRenderFallback, renderFallbackSource) &&
             modContext != nullptr && modContext->config.GetString)
@@ -1524,7 +1524,7 @@ namespace
 
         const MinimapPlacement placement = ParseMinimapPlacement(configuredPosition);
         const int toggleKey = ParseMinimapToggleKey(configuredToggleKey);
-        const bool renderFallback = ParseConfigBoolean(configuredRenderFallback, false);
+        const bool renderFallback = ParseConfigBoolean(configuredRenderFallback, true);
         const bool debugLogging = ParseConfigBoolean(configuredDebugLogging, false);
         const int mapSampleStep = ParseConfigInteger(configuredMapSampleStep, MINIMAP_DEFAULT_MAP_SAMPLE_STEP, 1, 4);
         const int maxIcons = ParseConfigInteger(configuredMaxIcons, MINIMAP_DEFAULT_MAX_DRAWN_POINTS, 8, 128);
