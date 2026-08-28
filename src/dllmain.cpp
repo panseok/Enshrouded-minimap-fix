@@ -526,6 +526,16 @@ namespace
         std::uint32_t flags = 0;
     };
 
+    constexpr std::uint32_t VK_STRUCTURE_TYPE_FENCE_CREATE_INFO = 8;
+    constexpr std::uint32_t VK_FENCE_CREATE_SIGNALED_BIT = 1;
+
+    struct VkFenceCreateInfo
+    {
+        std::uint32_t sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        const void* pNext = nullptr;
+        std::uint32_t flags = 0;
+    };
+
     struct VkMemoryRequirements
     {
         std::uint64_t size = 0;
@@ -903,6 +913,10 @@ namespace
     using CmdPushConstantsFn = void(__fastcall*)(void* commandBuffer, void* layout, std::uint32_t stageFlags, std::uint32_t offset, std::uint32_t size, const void* values);
     using CmdDrawFn = void(__fastcall*)(void* commandBuffer, std::uint32_t vertexCount, std::uint32_t instanceCount, std::uint32_t firstVertex, std::uint32_t firstInstance);
     using CreateSemaphoreFn = std::int32_t(__fastcall*)(void* device, const VkSemaphoreCreateInfo* createInfo, const void* allocator, void** semaphore);
+    using CreateFenceFn = std::int32_t(__fastcall*)(void* device, const VkFenceCreateInfo* createInfo, const void* allocator, void** fence);
+    using DestroyFenceFn = void(__fastcall*)(void* device, void* fence, const void* allocator);
+    using WaitForFencesFn = std::int32_t(__fastcall*)(void* device, std::uint32_t fenceCount, const void* const* fences, std::uint32_t waitAll, std::uint64_t timeout);
+    using ResetFencesFn = std::int32_t(__fastcall*)(void* device, std::uint32_t fenceCount, const void* const* fences);
     using DestroySemaphoreFn = void(__fastcall*)(void* device, void* semaphore, const void* allocator);
     using QueueSubmitFn = std::int32_t(__fastcall*)(void* queue, std::uint32_t submitCount, const VkSubmitInfo* submits, void* fence);
     using DeviceWaitIdleFn = std::int32_t(__fastcall*)(void* device);
@@ -981,6 +995,10 @@ namespace
         CmdDrawFn cmdDraw = nullptr;
         CreateSemaphoreFn createSemaphore = nullptr;
         DestroySemaphoreFn destroySemaphore = nullptr;
+        CreateFenceFn createFence = nullptr;
+        DestroyFenceFn destroyFence = nullptr;
+        WaitForFencesFn waitForFences = nullptr;
+        ResetFencesFn resetFences = nullptr;
         QueueSubmitFn queueSubmit = nullptr;
         DeviceWaitIdleFn deviceWaitIdle = nullptr;
 
@@ -1004,6 +1022,10 @@ namespace
                 cmdClearAttachments != nullptr &&
                 createSemaphore != nullptr &&
                 destroySemaphore != nullptr &&
+                createFence != nullptr &&
+                destroyFence != nullptr &&
+                waitForFences != nullptr &&
+                resetFences != nullptr &&
                 queueSubmit != nullptr &&
                 deviceWaitIdle != nullptr;
         }
@@ -1059,6 +1081,7 @@ namespace
         std::vector<uintptr_t> framebuffers;
         std::vector<uintptr_t> commandBuffers;
         std::vector<uintptr_t> renderCompleteSemaphores;
+        std::vector<uintptr_t> commandFences;
         uintptr_t renderPass = 0;
         uintptr_t commandPool = 0;
         uintptr_t frameTextureImage = 0;
@@ -1160,7 +1183,7 @@ namespace
     ModMetaData g_metaData = {
         "minimap_mod",
         "Internal minimap data bridge for Enshrouded. No external overlay window.",
-        "0.4.46-fix14",
+        "0.4.46-fix15",
         "OpenAI + xoker",
         "0.0.3",
         true,
@@ -3629,6 +3652,8 @@ namespace
         }
     }
 
+    bool TryResolveKnownMarkerIconKey(std::uint32_t candidate, std::uint32_t& outKey);
+
     struct CapturedMasterMarker
     {
         std::int64_t x = 0;
@@ -3677,6 +3702,41 @@ namespace
                 continue;
 
             markers.push_back(marker);
+        }
+
+        // Surface unknown icon keys (throttled): needed to identify e.g. remote-player
+        // markers so they can be mapped to a proper icon.
+        if (g_debugLoggingEnabled.load())
+        {
+            static std::atomic<DWORD> lastUnknownKeyLogTick{ 0 };
+            const DWORD now = GetTickCount();
+            const DWORD last = lastUnknownKeyLogTick.load();
+            if (last == 0 || now - last >= 15000)
+            {
+                std::ostringstream unknownKeys;
+                int unknownCount = 0;
+                for (const CapturedMasterMarker& marker : markers)
+                {
+                    std::uint32_t resolved = 0;
+                    if (marker.key == 0 || marker.key == MASTER_KEY_FLAME_ALTAR || marker.key == MASTER_KEY_PLAYER_PING ||
+                        TryResolveKnownMarkerIconKey(marker.key, resolved))
+                    {
+                        continue;
+                    }
+                    if (unknownCount != 0)
+                        unknownKeys << ",";
+                    unknownKeys << Hex(marker.key) << "@(" << FixedToWorld(marker.x) << "," << FixedToWorld(marker.z) << ")";
+                    if (++unknownCount >= 6)
+                        break;
+                }
+                if (unknownCount != 0)
+                {
+                    lastUnknownKeyLogTick.store(now);
+                    std::ostringstream oss;
+                    oss << "[Minimap] master markers with unknown icon keys | " << unknownKeys.str();
+                    Log(oss.str());
+                }
+            }
         }
 
         std::lock_guard<std::mutex> lock(g_masterMarkerMutex);
@@ -4707,6 +4767,10 @@ namespace
         fns.cmdPushConstants = ResolveDeviceFunction<CmdPushConstantsFn>(getDeviceProcAddr, device, "vkCmdPushConstants");
         fns.cmdDraw = ResolveDeviceFunction<CmdDrawFn>(getDeviceProcAddr, device, "vkCmdDraw");
         fns.createSemaphore = ResolveDeviceFunction<CreateSemaphoreFn>(getDeviceProcAddr, device, "vkCreateSemaphore");
+        fns.createFence = ResolveDeviceFunction<CreateFenceFn>(getDeviceProcAddr, device, "vkCreateFence");
+        fns.destroyFence = ResolveDeviceFunction<DestroyFenceFn>(getDeviceProcAddr, device, "vkDestroyFence");
+        fns.waitForFences = ResolveDeviceFunction<WaitForFencesFn>(getDeviceProcAddr, device, "vkWaitForFences");
+        fns.resetFences = ResolveDeviceFunction<ResetFencesFn>(getDeviceProcAddr, device, "vkResetFences");
         fns.destroySemaphore = ResolveDeviceFunction<DestroySemaphoreFn>(getDeviceProcAddr, device, "vkDestroySemaphore");
         fns.queueSubmit = ResolveDeviceFunction<QueueSubmitFn>(getDeviceProcAddr, device, "vkQueueSubmit");
         fns.deviceWaitIdle = ResolveDeviceFunction<DeviceWaitIdleFn>(getDeviceProcAddr, device, "vkDeviceWaitIdle");
@@ -5165,6 +5229,15 @@ namespace
                 }
             }
 
+            if (fns.destroyFence != nullptr)
+            {
+                for (uintptr_t fence : g_renderer.commandFences)
+                {
+                    if (fence != 0)
+                        fns.destroyFence(device, reinterpret_cast<void*>(fence), nullptr);
+                }
+            }
+
             if (fns.destroyFramebuffer != nullptr)
             {
                 for (uintptr_t framebuffer : g_renderer.framebuffers)
@@ -5387,6 +5460,24 @@ namespace
                 return false;
             }
             g_renderer.renderCompleteSemaphores[index] = reinterpret_cast<uintptr_t>(semaphore);
+        }
+
+        // Per-image fences (created signaled): resetting a command buffer that the GPU
+        // may still be executing is undefined behavior and can take down the device;
+        // each re-record now waits for the previous submit of that image to finish.
+        g_renderer.commandFences.assign(g_renderer.images.size(), 0);
+        VkFenceCreateInfo fenceInfo{};
+        fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        for (std::size_t index = 0; index < g_renderer.commandFences.size(); ++index)
+        {
+            void* fence = nullptr;
+            if (g_renderer.fns.createFence(device, &fenceInfo, nullptr, &fence) != VK_SUCCESS || fence == nullptr)
+            {
+                LogRendererThrottled("[Minimap] Vulkan minimap renderer not ready: fence creation failed");
+                DestroyVulkanMinimapRendererLocked();
+                return false;
+            }
+            g_renderer.commandFences[index] = reinterpret_cast<uintptr_t>(fence);
         }
 
         g_renderer.ready = true;
@@ -8254,12 +8345,33 @@ namespace
         if (!BuildVulkanMinimapRendererLocked(snapshot))
             return false;
 
-        if (imageIndex >= g_renderer.commandBuffers.size() || imageIndex >= g_renderer.renderCompleteSemaphores.size())
+        if (imageIndex >= g_renderer.commandBuffers.size() || imageIndex >= g_renderer.renderCompleteSemaphores.size() ||
+            imageIndex >= g_renderer.commandFences.size())
+        {
             return false;
+        }
+
+        // Wait until the GPU is done with this image's previous minimap submit before
+        // resetting/re-recording its command buffer (device-lost guard). A miss just
+        // skips the overlay for one frame.
+        void* commandFence = reinterpret_cast<void*>(g_renderer.commandFences[imageIndex]);
+        void* fenceDevice = reinterpret_cast<void*>(g_renderer.device);
+        const std::int32_t fenceWait = g_renderer.fns.waitForFences(fenceDevice, 1, &commandFence, 1, 8000000ull);
+        if (fenceWait != VK_SUCCESS)
+        {
+            LogRendererThrottled("[Minimap] Vulkan minimap draw skipped: previous frame still in flight");
+            return false;
+        }
 
         if (!RecordVulkanMinimapCommandLocked(imageIndex))
         {
             LogRendererThrottled("[Minimap] Vulkan minimap draw skipped: command recording failed");
+            return false;
+        }
+
+        if (g_renderer.fns.resetFences(fenceDevice, 1, &commandFence) != VK_SUCCESS)
+        {
+            LogRendererThrottled("[Minimap] Vulkan minimap draw skipped: fence reset failed");
             return false;
         }
 
@@ -8276,7 +8388,7 @@ namespace
         submitInfo.signalSemaphoreCount = 1;
         submitInfo.pSignalSemaphores = &signalSemaphore;
 
-        const std::int32_t submitResult = g_renderer.fns.queueSubmit(queue, 1, &submitInfo, nullptr);
+        const std::int32_t submitResult = g_renderer.fns.queueSubmit(queue, 1, &submitInfo, commandFence);
         if (submitResult != VK_SUCCESS)
         {
             std::ostringstream oss;
@@ -8284,6 +8396,9 @@ namespace
                 << " | result=" << submitResult
                 << " | image_index=" << imageIndex;
             LogRendererThrottled(oss.str());
+            // The fence stayed unsignaled; rebuild the renderer so it comes back
+            // signaled instead of deadlocking every following frame.
+            DestroyVulkanMinimapRendererLocked();
             return false;
         }
 
