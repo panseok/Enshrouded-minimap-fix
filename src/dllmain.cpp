@@ -1183,7 +1183,7 @@ namespace
     ModMetaData g_metaData = {
         "minimap_mod",
         "Internal minimap data bridge for Enshrouded. No external overlay window.",
-        "0.4.46-fix15",
+        "0.4.46-fix16",
         "OpenAI + xoker",
         "0.0.3",
         true,
@@ -5327,12 +5327,21 @@ namespace
         const std::uint32_t height = snapshot.height != 0 ? snapshot.height : fallbackHeight;
         const std::uint32_t format = snapshot.format != 0 ? snapshot.format : 37;
 
+        // Compare the image-handle set too: when the game recreates its swapchain the
+        // handle value can be reused, so matching only handle+extent would keep stale
+        // framebuffers/image views and fault the driver on submit. A changed image set
+        // forces a rebuild.
+        // When the snapshot carries image handles, a mismatch means the swapchain was
+        // recreated (possibly at the same handle value) and our objects are stale. When
+        // it carries none, fall back to handle+extent identity so we don't thrash.
+        const bool imagesConsistent = snapshot.images.empty() || g_renderer.images == snapshot.images;
         if (g_renderer.ready &&
             g_renderer.device == snapshot.device &&
             g_renderer.swapchain == snapshot.handle &&
             g_renderer.format == format &&
             g_renderer.width == width &&
-            g_renderer.height == height)
+            g_renderer.height == height &&
+            imagesConsistent)
         {
             return true;
         }
@@ -8314,6 +8323,27 @@ namespace
             firstSwapchain != 0;
     }
 
+    // The present hook runs on the game's render thread and calls the driver with our
+    // cached Vulkan handles. When the game tears down and recreates its swapchain (scene
+    // loads, resolution changes, and — crucially — handle-value reuse that defeats the
+    // rebuild check), those handles reference destroyed framebuffers/image views and the
+    // driver faults deep inside nvoglv64. SEH turns that fatal AV into a one-frame skip
+    // plus a renderer rebuild, instead of taking the whole game down. This function must
+    // contain no C++ objects needing unwinding (all such work lives in the callees).
+    int RecordAndSubmitMinimapGuarded(void* queue, const VkSubmitInfo* submitInfo, void* commandFence, std::uint32_t imageIndex)
+    {
+        __try
+        {
+            if (!RecordVulkanMinimapCommandLocked(imageIndex))
+                return -1;
+            return static_cast<int>(g_renderer.fns.queueSubmit(queue, 1, submitInfo, commandFence));
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return -1000;
+        }
+    }
+
     bool TrySubmitVulkanMinimap(void* queue, const VkPresentInfoKHR& info, uintptr_t firstSwapchain, std::uint32_t imageIndex, VkPresentInfoKHR& adjustedInfo, const void** adjustedWaitSemaphore)
     {
         if (queue == nullptr || firstSwapchain == 0 || info.waitSemaphoreCount > 8)
@@ -8363,12 +8393,6 @@ namespace
             return false;
         }
 
-        if (!RecordVulkanMinimapCommandLocked(imageIndex))
-        {
-            LogRendererThrottled("[Minimap] Vulkan minimap draw skipped: command recording failed");
-            return false;
-        }
-
         if (g_renderer.fns.resetFences(fenceDevice, 1, &commandFence) != VK_SUCCESS)
         {
             LogRendererThrottled("[Minimap] Vulkan minimap draw skipped: fence reset failed");
@@ -8388,16 +8412,17 @@ namespace
         submitInfo.signalSemaphoreCount = 1;
         submitInfo.pSignalSemaphores = &signalSemaphore;
 
-        const std::int32_t submitResult = g_renderer.fns.queueSubmit(queue, 1, &submitInfo, commandFence);
+        // Record + submit under SEH: a driver fault here (stale swapchain handles) must
+        // not crash the game. On any failure the fence stayed unsignaled, so rebuild the
+        // renderer to get a fresh signaled fence and valid handles next frame.
+        const int submitResult = RecordAndSubmitMinimapGuarded(queue, &submitInfo, commandFence, imageIndex);
         if (submitResult != VK_SUCCESS)
         {
             std::ostringstream oss;
-            oss << "[Minimap] Vulkan minimap draw skipped: queue submit failed"
+            oss << "[Minimap] Vulkan minimap draw skipped: record/submit failed"
                 << " | result=" << submitResult
                 << " | image_index=" << imageIndex;
             LogRendererThrottled(oss.str());
-            // The fence stayed unsignaled; rebuild the renderer so it comes back
-            // signaled instead of deadlocking every following frame.
             DestroyVulkanMinimapRendererLocked();
             return false;
         }
