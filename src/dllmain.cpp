@@ -1183,7 +1183,7 @@ namespace
     ModMetaData g_metaData = {
         "minimap_mod",
         "Internal minimap data bridge for Enshrouded. No external overlay window.",
-        "0.4.46-fix16",
+        "0.4.46-fix17",
         "OpenAI + xoker",
         "0.0.3",
         true,
@@ -2568,6 +2568,8 @@ namespace
     }
 
     CapturedPlayerPosition g_lastExactPosition{};
+    float g_lastHeadingRadians = 0.0f;
+    DWORD g_lastHeadingTick = 0;
 
     float WrapAngleRadians(float angle)
     {
@@ -2588,40 +2590,40 @@ namespace
             if (position.channel == 5)
                 g_lastExactPosition = position;
 
-            // A heading-less feed must not clobber a still-fresh heading-bearing one,
-            // otherwise the minimap/arrow stop rotating even though a live camera exists.
-            const bool keepHeadingBearing =
-                !position.hasHeading &&
-                g_playerPosition.valid &&
-                g_playerPosition.hasHeading &&
-                position.lastUpdateTick - g_playerPosition.lastUpdateTick < 3000;
-            if (!keepHeadingBearing)
-            {
-                CapturedPlayerPosition merged = position;
-                if (position.hasHeading && position.channel >= 20)
-                {
-                    // Camera blocks sit behind the player and swing while rotating, and
-                    // async reads can catch half-written data. Anchor the map center on
-                    // the exact player-position feed and take only the heading from the
-                    // camera, smoothed to hide the irregular sampling cadence.
-                    // The exact feed (state+0x1DCB8) freezes when the player travels far
-                    // from their base area, so trust it only while it agrees with the
-                    // live camera position (the camera hovers within ~30 units).
-                    if (g_lastExactPosition.valid &&
-                        position.lastUpdateTick - g_lastExactPosition.lastUpdateTick < 1500)
-                    {
-                        const float anchorDx = FixedToWorld(g_lastExactPosition.x) - FixedToWorld(position.x);
-                        const float anchorDz = FixedToWorld(g_lastExactPosition.z) - FixedToWorld(position.z);
-                        if (anchorDx * anchorDx + anchorDz * anchorDz < 150.0f * 150.0f)
-                        {
-                            merged.x = g_lastExactPosition.x;
-                            merged.y = g_lastExactPosition.y;
-                            merged.z = g_lastExactPosition.z;
-                        }
-                    }
+            CapturedPlayerPosition merged = position;
 
-                    // Heading smoothing happens at draw time (per frame); publishing the
-                    // raw value here avoids double-lag.
+            if (position.hasHeading && position.channel >= 20)
+            {
+                // Camera feed: anchor the map center on the exact player-position feed
+                // when it is fresh and agrees (the camera hovers within ~30 units), and
+                // keep the camera's heading. Heading smoothing happens at draw time.
+                if (g_lastExactPosition.valid &&
+                    position.lastUpdateTick - g_lastExactPosition.lastUpdateTick < 1500)
+                {
+                    const float anchorDx = FixedToWorld(g_lastExactPosition.x) - FixedToWorld(position.x);
+                    const float anchorDz = FixedToWorld(g_lastExactPosition.z) - FixedToWorld(position.z);
+                    if (anchorDx * anchorDx + anchorDz * anchorDz < 150.0f * 150.0f)
+                    {
+                        merged.x = g_lastExactPosition.x;
+                        merged.y = g_lastExactPosition.y;
+                        merged.z = g_lastExactPosition.z;
+                    }
+                }
+                g_lastHeadingRadians = position.headingRadians;
+                g_lastHeadingTick = position.lastUpdateTick;
+                g_playerPosition = merged;
+            }
+            else
+            {
+                // Heading-less feed (exact position): update the center but never zero
+                // the heading — carry the last camera heading forward while it is still
+                // recent (tracked by its own timestamp so the exact feed refreshing every
+                // frame can't keep a dead heading alive), otherwise the map snaps back to
+                // north between camera samples and wobbles.
+                if (g_lastHeadingTick != 0 && position.lastUpdateTick - g_lastHeadingTick < 2000)
+                {
+                    merged.hasHeading = true;
+                    merged.headingRadians = g_lastHeadingRadians;
                 }
                 g_playerPosition = merged;
             }
@@ -3300,6 +3302,29 @@ namespace
         if (promoted == 0)
             promoted = promotedAnyChange;
 
+        // Multiplayer: other players' cameras also live in memory near ours. Prefer the
+        // live candidate closest to the local player's exact position so the map does
+        // not lock onto a remote player's view (which oscillated the heading when a
+        // second player looked around). Order liveCandidates by that distance too, so
+        // the hold loop's fallbacks stay local-first.
+        if (havePlayer && !liveCandidates.empty())
+        {
+            const auto distToPlayer = [&](uintptr_t addr)
+            {
+                const CameraSample s = sampleCamera(addr);
+                if (!s.valid)
+                    return 1e30f;
+                const float dx = static_cast<float>(s.position[0] * FIXED_32_32_TO_WORLD) - playerX;
+                const float dz = static_cast<float>(s.position[2] * FIXED_32_32_TO_WORLD) - playerZ;
+                return dx * dx + dz * dz;
+            };
+            std::sort(liveCandidates.begin(), liveCandidates.end(), [&](uintptr_t a, uintptr_t b)
+            {
+                return distToPlayer(a) < distToPlayer(b);
+            });
+            promoted = liveCandidates.front();
+        }
+
         // If nothing moved during the short probe (player standing still, not turning),
         // keep watching the near-player candidates for a while instead of giving up:
         // the moment the player rotates the view, the real camera's quaternion changes
@@ -3371,8 +3396,10 @@ namespace
             PlayerPositionCandidate probe{};
             if (TryCaptureClientCameraAt(cameraAddress, cameraAddress, 0, 29, probe))
             {
-                // The real view camera hovers near the player; a valid-looking block far
-                // away is some other camera — rotate to the next candidate.
+                // The local view camera sits right on the local player; a valid block
+                // offset from the exact position is another player's camera (multiplayer)
+                // — rotate to the next candidate. Tight leash so a teammate standing a
+                // few tens of metres away can't hijack the heading.
                 bool nearPlayerNow = true;
                 {
                     std::lock_guard<std::mutex> lock(g_playerPositionMutex);
@@ -3380,7 +3407,7 @@ namespace
                     {
                         const float dx = FixedToWorld(probe.x) - FixedToWorld(g_lastExactPosition.x);
                         const float dz = FixedToWorld(probe.z) - FixedToWorld(g_lastExactPosition.z);
-                        nearPlayerNow = dx * dx + dz * dz < 250.0f * 250.0f;
+                        nearPlayerNow = dx * dx + dz * dz < 90.0f * 90.0f;
                     }
                 }
 
