@@ -1,0 +1,12 @@
+{
+  "id": "minimap_map_exporter",
+  "version": "0.1.0",
+  "name": "Minimap Map Exporter",
+  "description": "Exports Enshrouded's in-game Embervale map texture for the Shroudtopia minimap mod.",
+  "authors": [
+    "OpenAI + xoker"
+  ],
+  "capabilities": [
+    "export"
+  ]
+}

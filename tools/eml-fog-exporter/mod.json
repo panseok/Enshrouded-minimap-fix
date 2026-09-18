@@ -1,0 +1,12 @@
+{
+  "id": "minimap_fog_exporter",
+  "version": "0.1.0",
+  "name": "Minimap Fog Zone Exporter",
+  "description": "One-shot export of Enshrouded's shroud (FogZone) map textures for the Shroudtopia minimap mod.",
+  "authors": [
+    "OpenAI + xoker"
+  ],
+  "capabilities": [
+    "export"
+  ]
+}

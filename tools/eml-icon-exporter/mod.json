@@ -1,0 +1,12 @@
+{
+  "id": "minimap_icon_exporter",
+  "version": "0.1.0",
+  "name": "Minimap Map Marker Icon Exporter",
+  "description": "One-shot export of Enshrouded's map marker icons (MapMarkerRegistryResource) for the Shroudtopia minimap mod.",
+  "authors": [
+    "OpenAI + xoker"
+  ],
+  "capabilities": [
+    "export"
+  ]
+}
