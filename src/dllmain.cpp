@@ -8397,7 +8397,7 @@ namespace
         if (rgba.size() < static_cast<std::size_t>(width) * height * 4 || width == 0 || height == 0)
             return image;
 
-        const int radius = ClampValue(static_cast<int>(MaxValue(width, height)) / 24, 2, 6);
+        const int radius = ClampValue(static_cast<int>(MaxValue(width, height)) / 14, 4, 12);
         std::vector<std::uint8_t> alpha(static_cast<std::size_t>(width) * height, 0);
         std::vector<std::uint8_t> grown(alpha.size(), 0);
         for (std::size_t i = 0; i < alpha.size(); ++i)
@@ -8428,9 +8428,10 @@ namespace
                 if (best == 0)
                     continue;
                 image.rgba[index * 4 + 0] = 255;
-                image.rgba[index * 4 + 1] = 209;
-                image.rgba[index * 4 + 2] = 38;
-                image.rgba[index * 4 + 3] = best;
+                image.rgba[index * 4 + 1] = 205;
+                image.rgba[index * 4 + 2] = 20;
+                // Solid outline: everything the icon covers, even faintly, turns opaque.
+                image.rgba[index * 4 + 3] = best >= 40 ? 255 : static_cast<std::uint8_t>(best * 6);
             }
         }
         return image;
@@ -8441,19 +8442,18 @@ namespace
         constexpr std::uint32_t S = 96;
         SpriteImage image{ SPRITE_KEY_WAYPOINT_RING, S, S, std::vector<std::uint8_t>(S * S * 4, 0) };
         constexpr float CENTER = 48.0f;
-        constexpr float RADIUS = 40.0f;
-        constexpr float HALF_THICKNESS = 4.0f;
+        constexpr float RADIUS = 30.0f;
         for (std::uint32_t y = 0; y < S; ++y)
         {
             for (std::uint32_t x = 0; x < S; ++x)
             {
                 const float dx = static_cast<float>(x) + 0.5f - CENTER;
                 const float dy = static_cast<float>(y) + 0.5f - CENTER;
-                // Diamond: its edge is where |dx| + |dy| reaches the radius.
-                const float ring = std::fabs(std::fabs(dx) + std::fabs(dy) - RADIUS) * 0.7071f;
+                // Filled diamond: inside is where |dx| + |dy| stays under the radius.
+                const float diamond = (std::fabs(dx) + std::fabs(dy) - RADIUS) * 0.7071f;
                 std::uint8_t* out = image.rgba.data() + (static_cast<std::size_t>(y) * S + x) * 4;
-                BlendSpritePixel(out, 0.10f, 0.08f, 0.02f, SmoothCoverage(ring - (HALF_THICKNESS + 2.0f)) * 0.85f);
-                BlendSpritePixel(out, 1.00f, 0.82f, 0.15f, SmoothCoverage(ring - HALF_THICKNESS));
+                BlendSpritePixel(out, 0.10f, 0.08f, 0.02f, SmoothCoverage(diamond - 2.5f) * 0.85f);
+                BlendSpritePixel(out, 1.00f, 0.80f, 0.10f, SmoothCoverage(diamond));
             }
         }
         return image;
@@ -11448,7 +11448,7 @@ namespace
         return hash;
     }
 
-    constexpr DWORD PING_EVENT_HOLD_MS = 12000;
+    constexpr std::size_t PING_EVENT_MAX = 32;
     constexpr std::size_t PING_EVENT_SLOTS = 8;
 
     struct PingEventMark
@@ -11467,15 +11467,8 @@ namespace
 
     std::vector<PingEventMark> CopyPingEvents()
     {
-        const DWORD now = GetTickCount();
         std::lock_guard<std::mutex> lock(g_pingEventMutex);
-        std::vector<PingEventMark> result;
-        for (const PingEventMark& ping : g_pingEvents)
-        {
-            if (TicksSince(now, ping.tick) <= PING_EVENT_HOLD_MS)
-                result.push_back(ping);
-        }
-        return result;
+        return g_pingEvents;
     }
 
     struct PlayerWaypointMark
@@ -11842,27 +11835,24 @@ namespace
                             continue;
 
                         g_pingEventCount.fetch_add(1, std::memory_order_relaxed);
+                        // One ping per player: it stays until that player pings elsewhere.
                         std::uint32_t pingPlayer = 0;
                         std::memcpy(&pingPlayer, entry + UI_PING_EVENT_PLAYER_OFFSET, sizeof(pingPlayer));
                         bool merged = false;
                         for (PingEventMark& ping : g_pingEvents)
                         {
-                            if (std::fabs(ping.x - pingX) < 5.0f && std::fabs(ping.z - pingZ) < 5.0f)
+                            if (ping.playerId == pingPlayer)
                             {
+                                ping.x = pingX;
+                                ping.z = pingZ;
                                 ping.tick = now;
-                                ping.playerId = pingPlayer;
                                 merged = true;
                                 break;
                             }
                         }
-                        if (!merged)
+                        if (!merged && g_pingEvents.size() < PING_EVENT_MAX)
                             g_pingEvents.push_back({ pingX, pingZ, pingPlayer, now });
                     }
-                    g_pingEvents.erase(
-                        std::remove_if(g_pingEvents.begin(), g_pingEvents.end(), [now](const PingEventMark& ping) {
-                            return TicksSince(now, ping.tick) > PING_EVENT_HOLD_MS;
-                        }),
-                        g_pingEvents.end());
                     if (!sample.str().empty())
                         g_pingEventSample = sample.str();
                 }
@@ -12311,8 +12301,14 @@ namespace
 
         std::stable_sort(points.begin(), points.end(), [centerX, centerZ](const MinimapWorldPoint& left, const MinimapWorldPoint& right)
         {
-            const bool leftPlayer = left.kind == 13;
-            const bool rightPlayer = right.kind == 13;
+            // Players, pings and waypoints survive the cap even when they are far away.
+            const auto priority = [](const MinimapWorldPoint& point)
+            {
+                return point.kind == 13 || point.kind == MAP_MARKER_KEY_PLAYER_PING ||
+                    point.kind == SPRITE_KEY_WAYPOINT_RING || point.highlight != 0;
+            };
+            const bool leftPlayer = priority(left);
+            const bool rightPlayer = priority(right);
             if (leftPlayer != rightPlayer)
                 return leftPlayer;
             const float leftDx = left.x - centerX;
@@ -12945,7 +12941,10 @@ namespace
             // Markers beyond the minimap radius used to pile up on the rim (dozens of
             // icons, a large FPS cost). Only player-authored/critical kinds stay pinned
             // to the edge: red waypoint flags and other players.
-            if (clipped && point.kind != 11 && point.kind != 13)
+            const bool pinnedAtRim = point.kind == 11 || point.kind == 13 ||
+                point.kind == MAP_MARKER_KEY_PLAYER_PING || point.kind == SPRITE_KEY_WAYPOINT_RING ||
+                point.highlight != 0;
+            if (clipped && !pinnedAtRim)
                 continue;
 
             // NPCs: yellow dot. Other players: sky-blue dot.
@@ -12973,7 +12972,7 @@ namespace
 
             float drawSize = clipped ? iconSize * 0.75f : iconSize;
             if (point.kind == SPRITE_KEY_WAYPOINT_RING)
-                drawSize *= 1.35f;
+                drawSize *= 0.62f;
             if (point.highlight != 0)
             {
                 TryDrawSpriteGpu(renderer, commandBuffer, point.highlight,
