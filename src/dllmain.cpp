@@ -1315,6 +1315,21 @@ namespace
     std::atomic<bool> g_gameSessionOnline{ false };
     std::atomic<DWORD> g_lastWorldDataTick{ 0 };
     std::atomic<int> g_minimapZoomStep{ 0 };
+    // Layout edit mode (Esc menu). See UpdateMinimapLayoutEdit.
+    std::atomic<bool> g_layoutEditMode{ false };
+    std::atomic<int> g_layoutOffsetX{ 0 };
+    std::atomic<int> g_layoutOffsetY{ 0 };
+    std::atomic<int> g_layoutRadius{ 0 };          // 0 = automatic size
+    std::atomic<int> g_layoutRectCx{ 0 };
+    std::atomic<int> g_layoutRectCy{ 0 };
+    std::atomic<int> g_layoutRectHalf{ 0 };
+    std::atomic<int> g_layoutRectRadius{ 0 };
+    std::atomic<int> g_layoutRectFrameExtra{ 0 };
+    std::atomic<std::uint32_t> g_layoutScreenWidth{ 0 };
+    std::atomic<std::uint32_t> g_layoutScreenHeight{ 0 };
+    constexpr int LAYOUT_RADIUS_MIN = 60;
+    constexpr int LAYOUT_RADIUS_MAX = 320;
+    constexpr int LAYOUT_HANDLE_SIZE = 14;
     // "label_font_size" in shroudtopia.json: height of the player/ping name labels.
     constexpr int MINIMAP_LABEL_SIZE_DEFAULT = 17;
     std::atomic<int> g_minimapLabelFontSize{ MINIMAP_LABEL_SIZE_DEFAULT };
@@ -2254,7 +2269,7 @@ namespace
 
         CURSORINFO cursorInfo{};
         cursorInfo.cbSize = sizeof(cursorInfo);
-        if (GetCursorInfo(&cursorInfo) && (cursorInfo.flags & CURSOR_SHOWING) != 0)
+        if (GetCursorInfo(&cursorInfo) && (cursorInfo.flags & CURSOR_SHOWING) != 0 && !g_layoutEditMode.load())
             return false;
 
         return HasFreshPlayerPosition();
@@ -2719,7 +2734,7 @@ namespace
     float g_lastHeadingRadians = 0.0f;
     DWORD g_lastHeadingTick = 0;             // GetTickCount() when the heading arrived
     DWORD g_directFeedPublishTick = 0;       // GetTickCount() of the last live (6/7) publish
-    constexpr DWORD HEADING_SOURCE_HOLD_MS = 2500;
+    constexpr DWORD HEADING_SOURCE_HOLD_MS = 1200;
     std::uint32_t g_headingChannel = 0;      // feed currently steering the heading
     uintptr_t g_headingSource = 0;
     std::uint32_t g_headingSourceSwitches = 0;
@@ -2866,7 +2881,10 @@ namespace
                 // (more so with other players around). Follow one feed; switch only
                 // when it has gone quiet. A short hold made the arrow swing back and
                 // forth between two live cameras while standing still.
-                const bool sameSource = position.channel == g_headingChannel && position.source == g_headingSource;
+                // The camera hold (29) and the per-frame cached read (20) read the same
+                // camera block; a sample from the locked block counts whichever channel
+                // carried it, so a stalled hold thread cannot freeze the arrow.
+                const bool sameSource = position.source != 0 && position.source == g_headingSource;
                 const bool currentStale = g_lastHeadingTick == 0 || TicksSince(publishNow, g_lastHeadingTick) > HEADING_SOURCE_HOLD_MS;
                 if (sameSource || currentStale)
                 {
@@ -12792,11 +12810,23 @@ namespace
     void DrawMinimapWidget(VulkanMinimapRenderer& renderer, void* commandBuffer)
     {
         const int shortEdge = static_cast<int>(MinValue(renderer.width, renderer.height));
-        const int radius = ClampValue(shortEdge / 11, 104, 142);
+        const int autoRadius = ClampValue(shortEdge / 11, 104, 142);
+        const int customRadius = g_layoutRadius.load();
+        const int radius = customRadius > 0 ? ClampValue(customRadius, LAYOUT_RADIUS_MIN, LAYOUT_RADIUS_MAX) : autoRadius;
         const int marginX = MaxValue(58, static_cast<int>(renderer.width) / 58);
         const int marginY = MaxValue(52, static_cast<int>(renderer.height) / 42);
-        const int cx = static_cast<int>(renderer.width) - marginX - radius;
-        const int cy = ComputeMinimapCenterY(renderer.height, radius, marginY);
+        const int layoutHalf = radius + MinimapRasterFrameExtra(radius);
+        const int cx = ClampValue(static_cast<int>(renderer.width) - marginX - autoRadius + g_layoutOffsetX.load(),
+            layoutHalf, MaxValue(layoutHalf, static_cast<int>(renderer.width) - layoutHalf));
+        const int cy = ClampValue(ComputeMinimapCenterY(renderer.height, autoRadius, marginY) + g_layoutOffsetY.load(),
+            layoutHalf, MaxValue(layoutHalf, static_cast<int>(renderer.height) - layoutHalf));
+        g_layoutRectCx.store(cx);
+        g_layoutRectCy.store(cy);
+        g_layoutRectHalf.store(layoutHalf);
+        g_layoutRectRadius.store(radius);
+        g_layoutRectFrameExtra.store(MinimapRasterFrameExtra(radius));
+        g_layoutScreenWidth.store(renderer.width);
+        g_layoutScreenHeight.store(renderer.height);
         const int zoomStep = ClampValue(g_minimapZoomStep.load(), -3, 7);
         const float zoom = std::pow(1.32f, static_cast<float>(zoomStep));
         const float unitsPerPixel = MINIMAP_BASE_UNITS_PER_PIXEL / zoom;
@@ -12923,9 +12953,9 @@ namespace
         else
             CmdClearCompassFrameOverlay(renderer, commandBuffer, cx, cy, radius);
 
-        // Other players (and their names) belong on top of every other marker.
+        // Pings and other players (with their names) belong on top of every other marker.
         std::stable_partition(points.begin(), points.end(), [](const MinimapWorldPoint& point) {
-            return point.kind != 13;
+            return point.kind != 13 && point.kind != MAP_MARKER_KEY_PLAYER_PING;
         });
 
         const float iconSize = ClampValue(static_cast<float>(radius) * 0.2f, 22.0f, 30.0f);
@@ -13017,6 +13047,21 @@ namespace
         const float playerSize = ClampValue(static_cast<float>(radius) * 0.15f, 16.0f, 22.0f);
         if (!TryDrawSpriteGpu(renderer, commandBuffer, SPRITE_KEY_PLAYER, static_cast<float>(arrowX) + 0.5f, static_cast<float>(arrowY) + 0.5f, playerSize, arrowRotation, 1.0f, cx, cy, frameMapRadius))
             CmdClearPlayerTriangle(renderer, commandBuffer, arrowX, arrowY, playerSize, arrowRotation);
+
+        // Esc menu edit mode: a thin outline shows the drag area, the corner square resizes.
+        if (g_layoutEditMode.load())
+        {
+            const int left = cx - layoutHalf;
+            const int top = cy - layoutHalf;
+            const int size = layoutHalf * 2;
+            CmdClearRect(renderer, commandBuffer, 1.0f, 0.85f, 0.30f, 0.75f, left, top, size, 2);
+            CmdClearRect(renderer, commandBuffer, 1.0f, 0.85f, 0.30f, 0.75f, left, top + size - 2, size, 2);
+            CmdClearRect(renderer, commandBuffer, 1.0f, 0.85f, 0.30f, 0.75f, left, top, 2, size);
+            CmdClearRect(renderer, commandBuffer, 1.0f, 0.85f, 0.30f, 0.75f, left + size - 2, top, 2, size);
+            const int handle = LAYOUT_HANDLE_SIZE;
+            CmdClearRect(renderer, commandBuffer, 0.08f, 0.07f, 0.03f, 0.9f, cx + layoutHalf - handle - 1, cy + layoutHalf - handle - 1, handle + 2, handle + 2);
+            CmdClearRect(renderer, commandBuffer, 1.0f, 0.85f, 0.30f, 1.0f, cx + layoutHalf - handle, cy + layoutHalf - handle, handle, handle);
+        }
     }
 
     bool RecordVulkanMinimapCommandLocked(std::uint32_t imageIndex)
@@ -13180,6 +13225,189 @@ namespace
         return true;
     }
 
+    // ---- LAYOUT EDIT MODE (Esc menu: drag to move, corner handle to resize) ----
+    // Pressing Esc while playing opens the game menu and shows the cursor; from then until
+    // the cursor hides again the minimap stays on screen and can be dragged. The bottom
+    // right corner carries a handle that resizes it. The result is kept in
+    // mods\minimap_mod\minimap_layout.txt ("offset_x offset_y radius") and applied on load.
+    constexpr const char* LAYOUT_FILE_NAME = "mods\\minimap_mod\\minimap_layout.txt";
+
+    std::atomic<bool> g_layoutLoaded{ false };
+    std::atomic<DWORD> g_layoutEscapeTick{ 0 };   // last Esc press
+    bool g_layoutEscapeWasDown = false;             // input thread only
+
+    int g_layoutDragMode = 0;   // 0 none, 1 move, 2 resize (input thread only)
+    int g_layoutDragLastX = 0;
+    int g_layoutDragLastY = 0;
+    bool g_layoutDirty = false;
+
+    std::string LayoutFilePath()
+    {
+        return JoinPath(GetExecutableDirectory(), LAYOUT_FILE_NAME);
+    }
+
+    void EnsureLayoutLoaded()
+    {
+        if (g_layoutLoaded.exchange(true))
+            return;
+        std::ifstream file(LayoutFilePath());
+        int offsetX = 0;
+        int offsetY = 0;
+        int radius = 0;
+        if (file && (file >> offsetX >> offsetY >> radius))
+        {
+            g_layoutOffsetX.store(ClampValue(offsetX, -8192, 8192));
+            g_layoutOffsetY.store(ClampValue(offsetY, -8192, 8192));
+            g_layoutRadius.store(radius > 0 ? ClampValue(radius, LAYOUT_RADIUS_MIN, LAYOUT_RADIUS_MAX) : 0);
+            std::ostringstream oss;
+            oss << "[Minimap] layout loaded | offset=(" << g_layoutOffsetX.load() << "," << g_layoutOffsetY.load()
+                << ") | radius=" << g_layoutRadius.load();
+            Log(oss.str());
+        }
+    }
+
+    void SaveLayout()
+    {
+        std::ofstream file(LayoutFilePath(), std::ios::trunc);
+        if (!file)
+        {
+            Log("[Minimap] layout not saved (cannot write mods\\minimap_mod\\minimap_layout.txt)");
+            return;
+        }
+        file << g_layoutOffsetX.load() << " " << g_layoutOffsetY.load() << " " << g_layoutRadius.load() << "\n";
+        std::ostringstream oss;
+        oss << "[Minimap] layout saved | offset=(" << g_layoutOffsetX.load() << "," << g_layoutOffsetY.load()
+            << ") | radius=" << g_layoutRadius.load();
+        Log(oss.str());
+    }
+
+    bool TryGetCursorInGameWindow(int& outX, int& outY)
+    {
+        HWND window = GetForegroundWindow();
+        if (window == nullptr)
+            return false;
+        DWORD processId = 0;
+        GetWindowThreadProcessId(window, &processId);
+        if (processId != GetCurrentProcessId())
+            return false;
+        POINT cursor{};
+        if (!GetCursorPos(&cursor) || !ScreenToClient(window, &cursor))
+            return false;
+        RECT client{};
+        if (!GetClientRect(window, &client))
+            return false;
+        // The swapchain may be larger or smaller than the window (scaling): map through it.
+        const int clientWidth = MaxValue(1, static_cast<int>(client.right - client.left));
+        const int clientHeight = MaxValue(1, static_cast<int>(client.bottom - client.top));
+        const std::uint32_t screenWidth = g_layoutScreenWidth.load();
+        const std::uint32_t screenHeight = g_layoutScreenHeight.load();
+        if (screenWidth == 0 || screenHeight == 0)
+            return false;
+        outX = static_cast<int>(static_cast<std::int64_t>(cursor.x) * static_cast<std::int64_t>(screenWidth) / clientWidth);
+        outY = static_cast<int>(static_cast<std::int64_t>(cursor.y) * static_cast<std::int64_t>(screenHeight) / clientHeight);
+        return true;
+    }
+
+    // Called every frame from the render hook.
+    void UpdateMinimapLayoutEdit()
+    {
+        EnsureLayoutLoaded();
+
+        // Esc edge from the "currently down" bit: the "pressed since last call" bit is
+        // shared with the game and usually already consumed. The cursor only shows a few
+        // frames after the press, so the press is remembered for a moment.
+        const DWORD now = GetTickCount();
+        const bool escapeDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+        if ((escapeDown && !g_layoutEscapeWasDown) || (GetAsyncKeyState(VK_ESCAPE) & 0x0001) != 0)
+            g_layoutEscapeTick.store(now);
+        g_layoutEscapeWasDown = escapeDown;
+
+        CURSORINFO cursorInfo{};
+        cursorInfo.cbSize = sizeof(cursorInfo);
+        const bool cursorShowing = GetCursorInfo(&cursorInfo) && (cursorInfo.flags & CURSOR_SHOWING) != 0;
+        if (!cursorShowing)
+        {
+            if (g_layoutEditMode.exchange(false))
+            {
+                if (g_layoutDirty)
+                {
+                    g_layoutDirty = false;
+                    SaveLayout();
+                }
+                Log("[Minimap] layout edit mode off");
+            }
+            g_layoutDragMode = 0;
+            return;
+        }
+        const DWORD escapeTick = g_layoutEscapeTick.load();
+        if (!g_layoutEditMode.load() && escapeTick != 0 && TicksSince(now, escapeTick) < 1500)
+        {
+            g_layoutEditMode.store(true);
+            Log("[Minimap] layout edit mode on (drag the minimap to move it, the corner square to resize)");
+        }
+        if (!g_layoutEditMode.load())
+            return;
+
+        const bool buttonDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+        int mouseX = 0;
+        int mouseY = 0;
+        if (!buttonDown || !TryGetCursorInGameWindow(mouseX, mouseY))
+        {
+            if (g_layoutDragMode != 0 && g_layoutDirty)
+            {
+                g_layoutDirty = false;
+                SaveLayout();
+            }
+            g_layoutDragMode = 0;
+            return;
+        }
+
+        const int cx = g_layoutRectCx.load();
+        const int cy = g_layoutRectCy.load();
+        const int half = g_layoutRectHalf.load();
+        if (g_layoutDragMode == 0)
+        {
+            const bool onHandle = std::abs(mouseX - (cx + half)) <= LAYOUT_HANDLE_SIZE && std::abs(mouseY - (cy + half)) <= LAYOUT_HANDLE_SIZE;
+            const bool inside = std::abs(mouseX - cx) <= half && std::abs(mouseY - cy) <= half;
+            if (onHandle)
+                g_layoutDragMode = 2;
+            else if (inside)
+                g_layoutDragMode = 1;
+            else
+                return;
+            g_layoutDragLastX = mouseX;
+            g_layoutDragLastY = mouseY;
+            return;
+        }
+
+        const int deltaX = mouseX - g_layoutDragLastX;
+        const int deltaY = mouseY - g_layoutDragLastY;
+        g_layoutDragLastX = mouseX;
+        g_layoutDragLastY = mouseY;
+        if (deltaX == 0 && deltaY == 0)
+            return;
+
+        if (g_layoutDragMode == 1)
+        {
+            g_layoutOffsetX.store(g_layoutOffsetX.load() + deltaX);
+            g_layoutOffsetY.store(g_layoutOffsetY.load() + deltaY);
+            g_layoutDirty = true;
+        }
+        else
+        {
+            // The corner follows the cursor: half size = radius + frame margin.
+            const int wantedHalf = MaxValue(std::abs(mouseX - cx), std::abs(mouseY - cy));
+            const int frameExtra = g_layoutRectFrameExtra.load();
+            const int radius = ClampValue(wantedHalf - frameExtra, LAYOUT_RADIUS_MIN, LAYOUT_RADIUS_MAX);
+            if (radius != g_layoutRectRadius.load())
+            {
+                g_layoutRadius.store(radius);
+                g_layoutDirty = true;
+            }
+        }
+    }
+    // ---- END LAYOUT EDIT MODE ----
+
     void UpdateMinimapZoomHotkeys()
     {
         int step = g_minimapZoomStep.load();
@@ -13235,6 +13463,7 @@ namespace
 
         UpdateMinimapVisibilityHotkey();
         UpdateMinimapZoomHotkeys();
+        UpdateMinimapLayoutEdit();
     }
 
     void LogVulkanPresentInfo(void* queue, const void* presentInfo)
