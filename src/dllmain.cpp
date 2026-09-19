@@ -103,15 +103,6 @@ namespace
     constexpr DWORD SESSION_LOG_POLL_MS = 1000;
     constexpr DWORD SESSION_LOG_TAIL_BYTES = 128 * 1024;
     constexpr DWORD MINIMAP_CONFIG_POLL_MS = 1000;
-    constexpr DWORD PLAYER_CAMERA_SCAN_INTERVAL_MS = 350;
-    constexpr DWORD RENDER_CAMERA_SCAN_INTERVAL_MS = 1000;
-    constexpr std::size_t CLIENT_CAMERA_SIZE = 0x40;
-    constexpr std::size_t PLAYER_CAMERA_ROOT_SCAN_BYTES = 0x2600;
-    constexpr std::size_t PLAYER_CAMERA_CHILD_SCAN_BYTES = 0x1200;
-    constexpr std::size_t PLAYER_CAMERA_POINTER_SCAN_BYTES = 0x180;
-    constexpr std::size_t RENDER_CAMERA_ROOT_SCAN_BYTES = 0x1800;
-    constexpr std::size_t RENDER_CAMERA_CHILD_SCAN_BYTES = 0x800;
-    constexpr std::size_t RENDER_CAMERA_POINTER_SCAN_BYTES = 0x100;
     constexpr int REAL_MAP_MIN_TEXTURE_SIZE = 512;
     // 8192 = 1.25 world units per texel. The GPU map path samples it with trilinear
     // filtering, so large maps no longer cost anything per frame on the CPU.
@@ -1107,6 +1098,16 @@ namespace
         bool attempted = false;
     };
 
+    // A pipeline replaced while command buffers that reference it may still be in
+    // flight. It is destroyed once every swapchain image has been re-recorded (each
+    // re-record waits on that image's fence first), without stalling the device.
+    struct RetiredGpuPipeline
+    {
+        GpuTexturePipeline gp;
+        std::uint32_t seenImageMask = 0;
+        std::uint32_t records = 0;
+    };
+
     struct GpuSpriteRect
     {
         std::uint32_t key = 0;
@@ -1152,6 +1153,10 @@ namespace
         GpuTexturePipeline mapGpu;
         GpuTexturePipeline spriteGpu;
         std::vector<GpuSpriteRect> spriteRects;
+        std::vector<RetiredGpuPipeline> retiredPipelines;
+        // Redundant-bind filter, valid only inside one command-buffer recording.
+        uintptr_t boundPipeline = 0;
+        uintptr_t boundDescriptorSet = 0;
         VulkanRendererFns fns;
     };
 
@@ -1262,8 +1267,6 @@ namespace
     std::vector<CapturedMapMarkerVisibility> g_visibleMapMarkers;
     std::mutex g_playerPositionMutex;
     CapturedPlayerPosition g_playerPosition;
-    std::atomic<uintptr_t> g_playerCameraAddress{ 0 };
-    DWORD g_lastPlayerCameraScanTick = 0;
     DWORD g_lastSummaryTick = 0;
     DWORD g_lastNearbySummaryTick = 0;
     DWORD g_lastVisibleMapMarkerSummaryTick = 0;
@@ -1312,6 +1315,8 @@ namespace
     std::mutex g_minimapFrameMutex;
     MinimapFrameAsset g_minimapFrame;
     std::atomic<bool> g_worldSessionReady{ false };
+    // Every background tracker loop runs only while a world is up AND the mod is on.
+    bool MinimapRuntimeActive();
     std::atomic<bool> g_gameSessionOnline{ false };
     std::atomic<DWORD> g_lastWorldDataTick{ 0 };
     std::atomic<int> g_minimapZoomStep{ 0 };
@@ -1333,10 +1338,35 @@ namespace
     // "label_font_size" in shroudtopia.json: height of the player/ping name labels.
     constexpr int MINIMAP_LABEL_SIZE_DEFAULT = 17;
     std::atomic<int> g_minimapLabelFontSize{ MINIMAP_LABEL_SIZE_DEFAULT };
+    // "map_texture_size" in shroudtopia.json: the HD map (8192) is box-filtered down to
+    // this size at load time. 4096 cuts VRAM for the map from ~358 MB to ~90 MB.
+    constexpr int MINIMAP_MAP_TEXTURE_SIZE_DEFAULT = 8192;
+    std::atomic<int> g_minimapMapTextureSize{ MINIMAP_MAP_TEXTURE_SIZE_DEFAULT };
     std::atomic<int> g_nameSpriteBuiltSize{ 0 };
     std::atomic<bool> g_minimapVisible{ true };
+    // The F10 master switch. Off means the mod does nothing at all: the game-thread
+    // hooks return immediately, the background trackers stop, no command buffer is
+    // recorded or submitted in the present hook, and every Vulkan object (the map
+    // texture and the sprite atlas, together a few hundred MB of VRAM) is released.
+    std::atomic<bool> g_minimapEnabled{ true };
+    std::atomic<bool> g_minimapTeardownPending{ false };
+
+    bool MinimapRuntimeActive()
+    {
+        return g_worldSessionReady.load() && g_minimapEnabled.load();
+    }
+
+    // F11 (config "heading_toggle_key"): the view-direction feature. Off means no
+    // heading work at all and our own marker becomes a round lime dot.
+    std::atomic<bool> g_headingEnabled{ true };
+    std::atomic<int> g_headingToggleKey{ VK_F11 };
+    // The view direction is the direction of travel, taken from the position feed at
+    // no cost. (The old camera tracker found the camera with a full scan of the game's
+    // memory - ~2.4 GB, 1-2 s of one core every couple of minutes - and was removed.)
+
+    // Drops the direction learned so far.
+    void ResetHeadingState();
     std::atomic<int> g_minimapToggleKey{ VK_F10 };
-    std::atomic<bool> g_renderCameraFallbackEnabled{ true };
     std::atomic<bool> g_debugLoggingEnabled{ false };
     std::atomic<int> g_minimapMapSampleStep{ MINIMAP_DEFAULT_MAP_SAMPLE_STEP };
     // 0..100: how far the minimap terrain is lifted toward the big map's light
@@ -1352,18 +1382,9 @@ namespace
     std::atomic<int> g_minimapMaxDrawnPoints{ MINIMAP_DEFAULT_MAX_DRAWN_POINTS };
     DWORD g_lastConfigPollTick = 0;
     DWORD g_lastSessionLogPollTick = 0;
-    DWORD g_lastRenderCameraScanTick = 0;
     std::string g_gameLogPath;
     std::string g_shroudtopiaConfigPath;
 
-    enum class MinimapPlacement : int
-    {
-        TopRight = 0,
-        MiddleRight = 1,
-        BottomRight = 2
-    };
-
-    std::atomic<int> g_minimapPlacement{ static_cast<int>(MinimapPlacement::BottomRight) };
 
     std::array<std::uint8_t, LOCAL_PLAYER_UI_RENDER_SETUP_STOLEN_SIZE> g_localPlayerUiRenderSetupExpected = {
         0x48, 0x89, 0x7C, 0x24, 0x18,
@@ -1488,36 +1509,6 @@ namespace
         return normalized;
     }
 
-    MinimapPlacement ParseMinimapPlacement(const std::string& value)
-    {
-        const std::string normalized = NormalizeConfigValue(value);
-        if (normalized == "topright" || normalized == "top" || normalized == "tr")
-            return MinimapPlacement::TopRight;
-
-        if (normalized == "middleright" || normalized == "centerright" ||
-            normalized == "middle" || normalized == "center" ||
-            normalized == "right" || normalized == "mr")
-        {
-            return MinimapPlacement::MiddleRight;
-        }
-
-        return MinimapPlacement::BottomRight;
-    }
-
-    const char* MinimapPlacementName(MinimapPlacement placement)
-    {
-        switch (placement)
-        {
-        case MinimapPlacement::TopRight:
-            return "top-right";
-        case MinimapPlacement::MiddleRight:
-            return "middle-right";
-        case MinimapPlacement::BottomRight:
-        default:
-            return "bottom-right";
-        }
-    }
-
     int ParseMinimapToggleKey(const std::string& value)
     {
         const std::string normalized = NormalizeConfigValue(value);
@@ -1632,15 +1623,6 @@ namespace
 
     void RefreshMinimapConfig(ModContext* modContext, bool forceLog = false)
     {
-        std::string configuredPosition = "bottom-right";
-        std::string positionSource = "default";
-        if (!TryReadMinimapConfigStringFromFile(modContext, "position", configuredPosition, positionSource) &&
-            modContext != nullptr && modContext->config.GetString)
-        {
-            configuredPosition = modContext->config.GetString("minimap_mod", "position", configuredPosition);
-            positionSource = "shroudtopia_config_api";
-        }
-
         std::string configuredToggleKey = "F10";
         std::string toggleKeySource = "default";
         if (!TryReadMinimapConfigStringFromFile(modContext, "toggle_key", configuredToggleKey, toggleKeySource) &&
@@ -1650,13 +1632,13 @@ namespace
             toggleKeySource = "shroudtopia_config_api";
         }
 
-        std::string configuredRenderFallback = "true";
-        std::string renderFallbackSource = "default";
-        if (!TryReadMinimapConfigStringFromFile(modContext, "render_camera_fallback", configuredRenderFallback, renderFallbackSource) &&
+        std::string configuredHeadingToggleKey = "F11";
+        std::string headingToggleKeySource = "default";
+        if (!TryReadMinimapConfigStringFromFile(modContext, "heading_toggle_key", configuredHeadingToggleKey, headingToggleKeySource) &&
             modContext != nullptr && modContext->config.GetString)
         {
-            configuredRenderFallback = modContext->config.GetString("minimap_mod", "render_camera_fallback", configuredRenderFallback);
-            renderFallbackSource = "shroudtopia_config_api";
+            configuredHeadingToggleKey = modContext->config.GetString("minimap_mod", "heading_toggle_key", configuredHeadingToggleKey);
+            headingToggleKeySource = "shroudtopia_config_api";
         }
 
         std::string configuredDebugLogging = "false";
@@ -1720,6 +1702,25 @@ namespace
             g_minimapLabelFontSize.store(ClampValue(labelSize, 8, 40));
         }
 
+        std::string configuredMapTextureSize = std::to_string(MINIMAP_MAP_TEXTURE_SIZE_DEFAULT);
+        std::string mapTextureSizeSource = "default";
+        if (!TryReadMinimapConfigStringFromFile(modContext, "map_texture_size", configuredMapTextureSize, mapTextureSizeSource) &&
+            modContext != nullptr && modContext->config.GetString)
+        {
+            configuredMapTextureSize = modContext->config.GetString("minimap_mod", "map_texture_size", configuredMapTextureSize);
+            mapTextureSizeSource = "shroudtopia_config_api";
+        }
+        {
+            int textureSize = MINIMAP_MAP_TEXTURE_SIZE_DEFAULT;
+            const std::string normalized = NormalizeConfigValue(configuredMapTextureSize);
+            if (!normalized.empty() && normalized.find_first_not_of("0123456789") == std::string::npos)
+                textureSize = std::atoi(normalized.c_str());
+            // Only power-of-two sizes the 8192 source can be halved down to.
+            if (textureSize != 1024 && textureSize != 2048 && textureSize != 4096 && textureSize != 8192)
+                textureSize = MINIMAP_MAP_TEXTURE_SIZE_DEFAULT;
+            g_minimapMapTextureSize.store(textureSize);
+        }
+
         std::string configuredMapFollow = "center";
         std::string mapFollowSource = "default";
         if (!TryReadMinimapConfigStringFromFile(modContext, "map_follow", configuredMapFollow, mapFollowSource) &&
@@ -1729,9 +1730,9 @@ namespace
             mapFollowSource = "shroudtopia_config_api";
         }
 
-        const MinimapPlacement placement = ParseMinimapPlacement(configuredPosition);
         const int toggleKey = ParseMinimapToggleKey(configuredToggleKey);
-        const bool renderFallback = ParseConfigBoolean(configuredRenderFallback, true);
+        const int headingToggleKey = ParseMinimapToggleKey(configuredHeadingToggleKey);
+        g_headingToggleKey.store(headingToggleKey);
         const std::string normalizedMapFollow = NormalizeConfigValue(configuredMapFollow);
         const bool staticView = normalizedMapFollow == "static" || normalizedMapFollow == "fixed" ||
             normalizedMapFollow == "free" || normalizedMapFollow == "map";
@@ -1742,9 +1743,7 @@ namespace
         const std::string normalizedMapRenderer = NormalizeConfigValue(configuredMapRenderer);
         const bool mapGpu = !(normalizedMapRenderer == "cpu" || normalizedMapRenderer == "legacy" ||
             normalizedMapRenderer == "software" || normalizedMapRenderer == "false" || normalizedMapRenderer == "off");
-        const int previous = g_minimapPlacement.exchange(static_cast<int>(placement));
         const int previousToggleKey = g_minimapToggleKey.exchange(toggleKey);
-        const bool previousRenderFallback = g_renderCameraFallbackEnabled.exchange(renderFallback);
         const bool previousDebugLogging = g_debugLoggingEnabled.exchange(debugLogging);
         const int previousMapSampleStep = g_minimapMapSampleStep.exchange(mapSampleStep);
         const int previousMaxIcons = g_minimapMaxDrawnPoints.exchange(maxIcons);
@@ -1752,9 +1751,7 @@ namespace
         const bool previousMapGpu = g_minimapMapGpuEnabled.exchange(mapGpu);
         const bool previousStaticView = g_minimapStaticView.exchange(staticView);
         if (!forceLog &&
-            previous == static_cast<int>(placement) &&
             previousToggleKey == toggleKey &&
-            previousRenderFallback == renderFallback &&
             previousDebugLogging == debugLogging &&
             previousMapSampleStep == mapSampleStep &&
             previousMaxIcons == maxIcons &&
@@ -1767,14 +1764,10 @@ namespace
 
         std::ostringstream oss;
         oss << "[Minimap] config"
-            << " | position=" << MinimapPlacementName(placement)
-            << " | raw=" << configuredPosition
-            << " | position_source=" << positionSource
             << " | toggle_key=" << MinimapToggleKeyName(toggleKey)
+            << " | heading_toggle_key=" << MinimapToggleKeyName(headingToggleKey)
             << " | toggle_raw=" << configuredToggleKey
             << " | toggle_source=" << toggleKeySource
-            << " | render_camera_fallback=" << (renderFallback ? "on" : "off")
-            << " | render_camera_fallback_source=" << renderFallbackSource
             << " | debug_logging=" << (debugLogging ? "on" : "off")
             << " | debug_logging_source=" << debugLoggingSource
             << " | map_sample_step=" << mapSampleStep
@@ -1787,6 +1780,7 @@ namespace
             << " | map_renderer_source=" << mapRendererSource
             << " | label_font_size=" << g_minimapLabelFontSize.load()
             << " | label_font_size_source=" << labelSizeSource
+            << " | map_texture_size=" << g_minimapMapTextureSize.load()
             << " | map_follow=" << (staticView ? "static" : "center")
             << " | map_follow_source=" << mapFollowSource;
         Log(oss.str());
@@ -1796,24 +1790,12 @@ namespace
     {
         const int screenHeight = static_cast<int>(height);
         const int top = marginY + radius;
-        const int bottom = screenHeight - marginY - radius;
         const int safeTop = radius + 8;
         const int safeBottom = MaxValue(safeTop, screenHeight - radius - 8);
 
-        MinimapPlacement placement = MinimapPlacement::BottomRight;
-        const int rawPlacement = g_minimapPlacement.load();
-        if (rawPlacement == static_cast<int>(MinimapPlacement::TopRight))
-            placement = MinimapPlacement::TopRight;
-        else if (rawPlacement == static_cast<int>(MinimapPlacement::MiddleRight))
-            placement = MinimapPlacement::MiddleRight;
-
-        int cy = bottom;
-        if (placement == MinimapPlacement::TopRight)
-            cy = top;
-        else if (placement == MinimapPlacement::MiddleRight)
-            cy = screenHeight / 2;
-
-        return ClampValue(cy, safeTop, safeBottom);
+        // The minimap starts in the top-right corner; where it goes from there is up to
+        // the Esc-menu drag (saved in minimap_layout.txt as an offset from this spot).
+        return ClampValue(top, safeTop, safeBottom);
     }
 
     bool SafeRead(uintptr_t address, void* buffer, std::size_t size)
@@ -2521,9 +2503,6 @@ namespace
         const bool wasOnline = g_gameSessionOnline.exchange(false);
         const bool wasReady = g_worldSessionReady.exchange(false);
         g_lastWorldDataTick.store(0);
-        g_playerCameraAddress.store(0);
-        g_lastPlayerCameraScanTick = 0;
-        g_lastRenderCameraScanTick = 0;
 
         {
             std::lock_guard<std::mutex> lock(g_playerPositionMutex);
@@ -2731,13 +2710,7 @@ namespace
     }
 
     CapturedPlayerPosition g_lastExactPosition{};
-    float g_lastHeadingRadians = 0.0f;
-    DWORD g_lastHeadingTick = 0;             // GetTickCount() when the heading arrived
     DWORD g_directFeedPublishTick = 0;       // GetTickCount() of the last live (6/7) publish
-    constexpr DWORD HEADING_SOURCE_HOLD_MS = 1200;
-    std::uint32_t g_headingChannel = 0;      // feed currently steering the heading
-    uintptr_t g_headingSource = 0;
-    std::uint32_t g_headingSourceSwitches = 0;
     std::atomic<std::uint32_t> g_foreignUiStateReads{ 0 };
 
     // Milliseconds since `then`; 0 when `then` is not in the past. Feeds are captured
@@ -2756,20 +2729,6 @@ namespace
         return angle;
     }
 
-    // Camera -> player offset, kept in the camera's own frame (forward, right) so it
-    // stays valid while the camera orbits. Learned from the exact position feed.
-    struct CameraPivotOffset
-    {
-        float forward = 0.0f;
-        float right = 0.0f;
-        float up = 0.0f;
-        std::int64_t lastExactX = 0;
-        std::int64_t lastExactZ = 0;
-        DWORD lastLearnTick = 0;
-        bool valid = false;
-    };
-    CameraPivotOffset g_cameraPivotOffset;
-
     struct PositionFeedStats
     {
         std::uint32_t publishes[32] = {};
@@ -2777,14 +2736,6 @@ namespace
         std::int64_t lastX[32] = {};
         std::int64_t lastZ[32] = {};
         DWORD windowStart = 0;
-        // heading check: bearing of the last >=2 unit move of the live feed vs the
-        // camera heading at that moment (both clockwise from north, degrees)
-        float anchorX = 0.0f;
-        float anchorZ = 0.0f;
-        bool anchorValid = false;
-        float moveBearingDeg = 0.0f;
-        float headingAtMoveDeg = 0.0f;
-        bool moveValid = false;
     };
     PositionFeedStats g_positionFeedStats;
 
@@ -2798,29 +2749,6 @@ namespace
             ++stats.changes[channel];
             stats.lastX[channel] = position.x;
             stats.lastZ[channel] = position.z;
-        }
-
-        if (position.channel == 6 || position.channel == 7)
-        {
-            const float x = FixedToWorld(position.x);
-            const float z = FixedToWorld(position.z);
-            if (!stats.anchorValid)
-            {
-                stats.anchorX = x;
-                stats.anchorZ = z;
-                stats.anchorValid = true;
-            }
-            const float dx = x - stats.anchorX;
-            const float dz = z - stats.anchorZ;
-            if (dx * dx + dz * dz >= 4.0f)
-            {
-                constexpr float kDeg = 57.29578f;
-                stats.moveBearingDeg = std::atan2(dx, dz) * kDeg;
-                stats.headingAtMoveDeg = g_lastHeadingRadians * kDeg;
-                stats.moveValid = true;
-                stats.anchorX = x;
-                stats.anchorZ = z;
-            }
         }
 
         const DWORD now = position.lastUpdateTick;
@@ -2841,16 +2769,7 @@ namespace
                     << " publish=" << stats.publishes[index]
                     << " moved=" << stats.changes[index];
             }
-            oss << " | heading_deg=" << (g_lastHeadingRadians * 57.29578f)
-                << " heading_feed=" << PlayerPositionChannelName(g_headingChannel)
-                << " heading_switches=" << g_headingSourceSwitches
-                << " | foreign_ui_state_reads=" << g_foreignUiStateReads.exchange(0);
-            g_headingSourceSwitches = 0;
-            if (stats.moveValid)
-                oss << " | last_move_bearing_deg=" << stats.moveBearingDeg << " heading_then_deg=" << stats.headingAtMoveDeg;
-            oss << " | pivot_offset=" << (g_cameraPivotOffset.valid ? "on" : "off")
-                << " f=" << g_cameraPivotOffset.forward
-                << " r=" << g_cameraPivotOffset.right;
+            oss << " | foreign_ui_state_reads=" << g_foreignUiStateReads.exchange(0);
             Log(oss.str());
         }
 
@@ -2859,119 +2778,104 @@ namespace
         stats.windowStart = now;
     }
 
+    // Movement heading: the facing direction on the world X/Z plane is (sin h, cos h),
+    // so the direction of travel from A to B is h = atan2(dx, dz). The position feed
+    // updates ~80 times a second in steps of a few centimetres, so the heading is taken
+    // over the last ~0.5 m travelled instead of per sample (per-sample deltas are pure
+    // noise). Standing still keeps the last direction. Guarded by g_playerPositionMutex.
+    // Step 0.5 m / blend 0.7 was tuned offline: a 90-degree turn at walking speed lands
+    // within 15 degrees in ~0.2 s, and walking straight wobbles by under ~5 degrees.
+    struct MovementHeadingState
+    {
+        bool anchorValid = false;
+        float anchorX = 0.0f;
+        float anchorZ = 0.0f;
+        std::uint32_t anchorChannel = 0;
+        bool valid = false;
+        float heading = 0.0f;
+    };
+    MovementHeadingState g_movementHeading;
+    constexpr float MOVEMENT_HEADING_STEP = 0.5f;       // world units travelled per update
+    constexpr float MOVEMENT_HEADING_TELEPORT = 60.0f;  // larger jumps re-anchor only
+
+    void ResetMovementHeadingLocked()
+    {
+        g_movementHeading = MovementHeadingState{};
+    }
+
+    void ResetHeadingState()
+    {
+        std::lock_guard<std::mutex> lock(g_playerPositionMutex);
+        ResetMovementHeadingLocked();
+    }
+
+    void UpdateMovementHeadingLocked(float x, float z, std::uint32_t channel)
+    {
+        MovementHeadingState& state = g_movementHeading;
+        // A different feed may sit on a slightly different point of the player: start
+        // over from it rather than reading the gap between the two as movement.
+        if (!state.anchorValid || state.anchorChannel != channel)
+        {
+            state.anchorValid = true;
+            state.anchorX = x;
+            state.anchorZ = z;
+            state.anchorChannel = channel;
+            return;
+        }
+
+        const float dx = x - state.anchorX;
+        const float dz = z - state.anchorZ;
+        const float distanceSq = dx * dx + dz * dz;
+        if (distanceSq < MOVEMENT_HEADING_STEP * MOVEMENT_HEADING_STEP)
+            return;
+
+        state.anchorX = x;
+        state.anchorZ = z;
+        if (distanceSq > MOVEMENT_HEADING_TELEPORT * MOVEMENT_HEADING_TELEPORT)
+            return;   // fast travel / respawn: not a direction
+
+        const float target = std::atan2(dx, dz);
+        if (!state.valid)
+        {
+            state.heading = target;
+            state.valid = true;
+        }
+        else
+        {
+            // Partial blend per step: strafing and zig-zags wobble less, a real turn
+            // still lands within two or three steps.
+            state.heading = WrapAngleRadians(state.heading + WrapAngleRadians(target - state.heading) * 0.7f);
+        }
+    }
+
     void PublishPlayerPosition(const CapturedPlayerPosition& position)
     {
         {
             std::lock_guard<std::mutex> lock(g_playerPositionMutex);
             NotePositionFeedSample(position);
 
-            // Remember the newest exact UI-state position separately: when the camera
-            // hold takes over the main slot, the exact feed keeps flowing here.
-            if (position.channel == 5 || position.channel == 6 || position.channel == 7)
-                g_lastExactPosition = position;
-
-            CapturedPlayerPosition merged = position;
-
-            // All timing below uses the publish time taken under the lock, so it is
-            // monotonic across the UI, render and camera threads.
-            const DWORD publishNow = GetTickCount();
-            if (position.hasHeading)
+            // Direct feeds: the UI-state live slot (7), the memory tracker (6) and the
+            // fixed UI-state slot (5). They also drive the movement heading.
+            const bool isDirectFeed = position.channel == 5 || position.channel == 6 || position.channel == 7;
+            if (isDirectFeed)
             {
-                // Several camera feeds report a heading and they do not always agree
-                // (more so with other players around). Follow one feed; switch only
-                // when it has gone quiet. A short hold made the arrow swing back and
-                // forth between two live cameras while standing still.
-                // The camera hold (29) and the per-frame cached read (20) read the same
-                // camera block; a sample from the locked block counts whichever channel
-                // carried it, so a stalled hold thread cannot freeze the arrow.
-                const bool sameSource = position.source != 0 && position.source == g_headingSource;
-                const bool currentStale = g_lastHeadingTick == 0 || TicksSince(publishNow, g_lastHeadingTick) > HEADING_SOURCE_HOLD_MS;
-                if (sameSource || currentStale)
-                {
-                    if (!sameSource)
-                        ++g_headingSourceSwitches;
-                    g_headingChannel = position.channel;
-                    g_headingSource = position.source;
-                    g_lastHeadingRadians = position.headingRadians;
-                    g_lastHeadingTick = publishNow;
-                }
+                g_lastExactPosition = position;
+                if (g_headingEnabled.load())
+                    UpdateMovementHeadingLocked(FixedToWorld(position.x), FixedToWorld(position.z), position.channel);
             }
+
+            const DWORD publishNow = GetTickCount();
             if (position.channel == 6 || position.channel == 7)
                 g_directFeedPublishTick = publishNow;
 
-            // A direct live position (UI-state live slot or the memory tracker) is the
-            // authority. Camera feeds then only steer the heading; letting both move the
-            // map made it flicker between the two estimates.
+            // A live direct feed is the authority; the heuristic block scans only fill in
+            // while it is silent (letting both move the map made it flicker).
             const bool directLive = g_directFeedPublishTick != 0 && TicksSince(publishNow, g_directFeedPublishTick) < 1000;
-            const bool isDirectFeed = position.channel == 5 || position.channel == 6 || position.channel == 7;
-            if (!isDirectFeed && directLive)
+            if (isDirectFeed || !directLive)
             {
-                // heading already recorded above
-            }
-            else if (position.hasHeading && position.channel >= 20)
-            {
-                // Camera feed (fast, ~100 Hz from the camera hold) vs exact feed (the
-                // player's own position, but it only refreshes when the UI hook runs).
-                // Snapping the map to the exact feed made it move in slow steps, so the
-                // map now follows the camera and adds the camera->player offset, which
-                // is learned from the exact feed whenever that one reports a new value.
-                // The offset is stored in the camera frame (forward/right from the
-                // camera heading h; facing direction on the world X/Z plane is
-                // (sin h, cos h)), so orbiting the camera does not drag the map.
-                const float cameraX = FixedToWorld(position.x);
-                const float cameraZ = FixedToWorld(position.z);
-                const float sinH = std::sin(position.headingRadians);
-                const float cosH = std::cos(position.headingRadians);
-                CameraPivotOffset& pivot = g_cameraPivotOffset;
-
-                const bool exactFresh = g_lastExactPosition.valid &&
-                    position.lastUpdateTick - g_lastExactPosition.lastUpdateTick < 1500;
-                if (exactFresh &&
-                    (!pivot.valid || g_lastExactPosition.x != pivot.lastExactX || g_lastExactPosition.z != pivot.lastExactZ))
-                {
-                    const float dx = FixedToWorld(g_lastExactPosition.x) - cameraX;
-                    const float dz = FixedToWorld(g_lastExactPosition.z) - cameraZ;
-                    const float dy = FixedToWorld(g_lastExactPosition.y) - FixedToWorld(position.y);
-                    if (dx * dx + dz * dz < 150.0f * 150.0f)
-                    {
-                        const float forward = dx * sinH + dz * cosH;
-                        const float right = dx * cosH - dz * sinH;
-                        // First sample (or a long gap) snaps; later samples are blended
-                        // so the step lag of the exact feed averages out.
-                        const bool snap = !pivot.valid || position.lastUpdateTick - pivot.lastLearnTick > 3000;
-                        const float blend = snap ? 1.0f : 0.25f;
-                        pivot.forward += (forward - pivot.forward) * blend;
-                        pivot.right += (right - pivot.right) * blend;
-                        pivot.up += (dy - pivot.up) * blend;
-                        pivot.valid = true;
-                        pivot.lastLearnTick = position.lastUpdateTick;
-                    }
-                    pivot.lastExactX = g_lastExactPosition.x;
-                    pivot.lastExactZ = g_lastExactPosition.z;
-                }
-
-                if (pivot.valid && position.lastUpdateTick - pivot.lastLearnTick < 30000)
-                {
-                    const float offsetX = pivot.forward * sinH + pivot.right * cosH;
-                    const float offsetZ = pivot.forward * cosH - pivot.right * sinH;
-                    merged.x = WorldToFixed(cameraX + offsetX);
-                    merged.y = WorldToFixed(FixedToWorld(position.y) + pivot.up);
-                    merged.z = WorldToFixed(cameraZ + offsetZ);
-                }
-                g_playerPosition = merged;
-            }
-            else
-            {
-                // Heading-less feed (exact position): update the center but never zero
-                // the heading — carry the last camera heading forward while it is still
-                // recent (tracked by its own timestamp so the exact feed refreshing every
-                // frame can't keep a dead heading alive), otherwise the map snaps back to
-                // north between camera samples and wobbles.
-                if (g_lastHeadingTick != 0 && TicksSince(publishNow, g_lastHeadingTick) < 2000)
-                {
-                    merged.hasHeading = true;
-                    merged.headingRadians = g_lastHeadingRadians;
-                }
+                CapturedPlayerPosition merged = position;
+                merged.hasHeading = false;
+                merged.headingRadians = 0.0f;
                 g_playerPosition = merged;
             }
         }
@@ -3007,17 +2911,12 @@ namespace
             return false;
 
         outPosition = g_playerPosition;
-        // The view direction comes from the camera feeds and is kept separately from
-        // the position (which the live slot owns); always hand out the newest one.
-        if (g_lastHeadingTick != 0 && TicksSince(now, g_lastHeadingTick) < 2000)
-        {
-            outPosition.hasHeading = true;
-            outPosition.headingRadians = g_lastHeadingRadians;
-        }
+        // The view direction is the direction of travel (see UpdateMovementHeadingLocked).
+        outPosition.hasHeading = g_headingEnabled.load() && g_movementHeading.valid;
+        outPosition.headingRadians = outPosition.hasHeading ? g_movementHeading.heading : 0.0f;
         return true;
     }
 
-    bool TryCaptureCameraPositionFromBlock(uintptr_t base, std::uint32_t channel, std::size_t scanBytes, PlayerPositionCandidate& best);
     bool PublishBestPlayerPosition(const PlayerPositionCandidate& best);
     bool IsLikelyRuntimePointer(uintptr_t value);
     bool IsOnMapWorldPosition(float x, float y, float z);
@@ -3203,22 +3102,6 @@ namespace
                 return false;
         }
 
-        // The exact slot freezes far away from the player's base area. When a live
-        // camera feed exists and strongly disagrees, the frozen value must not be
-        // published at all (otherwise the map snaps back home whenever the camera
-        // hold pauses for a rescan).
-        {
-            std::lock_guard<std::mutex> lock(g_playerPositionMutex);
-            if (g_playerPosition.valid && g_playerPosition.hasHeading && g_playerPosition.channel == 29 &&
-                GetTickCount() - g_playerPosition.lastUpdateTick < 5000)
-            {
-                const float dx = FixedToWorld(x) - FixedToWorld(g_playerPosition.x);
-                const float dz = FixedToWorld(z) - FixedToWorld(g_playerPosition.z);
-                if (dx * dx + dz * dz > 150.0f * 150.0f)
-                    return false;
-            }
-        }
-
         CapturedPlayerPosition position{};
         position.x = x;
         position.y = y;
@@ -3238,34 +3121,18 @@ namespace
         if (record.state == nullptr || !AcceptUiState(record.state))
             return false;
 
-        // Heading-bearing camera blocks first (full signature incl. quaternion/fov).
+        // Exact known offset beats heuristic block scans (which can latch onto static
+        // decoys like the (0, 0, 256.079) block at the old camera offset).
+        if (TryPublishExactUiStatePosition(record.state))
+            return true;
+
         PlayerPositionCandidate best{};
-        TryCaptureCameraPositionFromBlock(reinterpret_cast<uintptr_t>(record.state + UI_STATE_CAMERA_BLOCK_NEW - 0x40), 26, 0x1C0, best);
-        TryCaptureCameraPositionFromBlock(reinterpret_cast<uintptr_t>(record.state + UI_STATE_CAMERA_BLOCK_OLD - 0x40), 27, 0x1C0, best);
-        TryCaptureCameraPositionFromBlock(reinterpret_cast<uintptr_t>(record.source), 28, 0x340, best);
-
-        if (!best.valid)
-        {
-            // Exact known offset beats heuristic block scans (which can latch onto
-            // static decoys like the (0, 0, 256.079) block at the old camera offset).
-            if (TryPublishExactUiStatePosition(record.state))
-                return true;
-
-            TryCapturePlayerPositionFromBlock(reinterpret_cast<uintptr_t>(record.source), 1, 0x340, best);
-            TryCapturePlayerPositionFromBlock(reinterpret_cast<uintptr_t>(record.local30), 2, 0x40, best);
-            TryCapturePlayerPositionFromBlock(reinterpret_cast<uintptr_t>(record.state + UI_STATE_CAMERA_BLOCK_OLD), 3, 0x40, best);
-            TryCapturePlayerPositionFromBlock(reinterpret_cast<uintptr_t>(record.state + UI_STATE_CAMERA_BLOCK_NEW), 4, 0x40, best);
-        }
-
+        TryCapturePlayerPositionFromBlock(reinterpret_cast<uintptr_t>(record.source), 1, 0x340, best);
+        TryCapturePlayerPositionFromBlock(reinterpret_cast<uintptr_t>(record.local30), 2, 0x40, best);
+        TryCapturePlayerPositionFromBlock(reinterpret_cast<uintptr_t>(record.state + UI_STATE_CAMERA_BLOCK_OLD), 3, 0x40, best);
+        TryCapturePlayerPositionFromBlock(reinterpret_cast<uintptr_t>(record.state + UI_STATE_CAMERA_BLOCK_NEW), 4, 0x40, best);
         if (!best.valid)
             return false;
-
-        if (best.hasHeading)
-        {
-            const uintptr_t cameraAddress = best.source + best.offset;
-            if (IsLikelyRuntimePointer(cameraAddress))
-                g_playerCameraAddress.store(cameraAddress);
-        }
 
         return PublishBestPlayerPosition(best);
     }
@@ -3273,175 +3140,6 @@ namespace
     bool IsLikelyRuntimePointer(uintptr_t value)
     {
         return value > 0x10000 && value < 0x0000800000000000;
-    }
-
-    float QuaternionYawFromMemory(const float quaternion[4])
-    {
-        const float qx = quaternion[0];
-        const float qy = quaternion[1];
-        const float qz = quaternion[2];
-        const float qw = quaternion[3];
-        return std::atan2(2.0f * (qw * qy + qx * qz), 1.0f - 2.0f * (qy * qy + qz * qz));
-    }
-
-    bool TryScoreCameraPosition(float worldX, float worldZ, std::uint32_t offset, float& outScore)
-    {
-        if (worldX < -512.0f || worldZ < -512.0f ||
-            worldX > REAL_MAP_WORLD_SIZE + 512.0f ||
-            worldZ > REAL_MAP_WORLD_SIZE + 512.0f)
-        {
-            return false;
-        }
-
-        outScore = static_cast<float>(offset);
-        return true;
-    }
-
-    // Static decoy blocks can pass the camera signature but never move (seen on the
-    // May-24-2026 client: a block frozen at world 132.238/768.084/132.238). Once a cached
-    // camera is detected as frozen it is banned for a while so rescans skip it.
-    constexpr DWORD CAMERA_FROZEN_EVICT_MS = 20000;
-    constexpr DWORD CAMERA_BAN_MS = 60000;
-
-    std::mutex g_cameraBanMutex;
-    struct CameraBanEntry
-    {
-        uintptr_t address = 0;
-        DWORD tick = 0;
-    };
-    CameraBanEntry g_cameraBans[4] = {};
-    std::size_t g_cameraBanCursor = 0;
-    CapturedPlayerPosition g_lastCachedCameraSample{};
-    DWORD g_cachedCameraLastChangeTick = 0;
-
-    bool IsCameraAddressBanned(uintptr_t address)
-    {
-        const DWORD now = GetTickCount();
-        std::lock_guard<std::mutex> lock(g_cameraBanMutex);
-        for (const CameraBanEntry& entry : g_cameraBans)
-        {
-            if (entry.address == address && entry.address != 0 && now - entry.tick < CAMERA_BAN_MS)
-                return true;
-        }
-        return false;
-    }
-
-    void BanCameraAddress(uintptr_t address)
-    {
-        if (address == 0)
-            return;
-
-        std::lock_guard<std::mutex> lock(g_cameraBanMutex);
-        g_cameraBans[g_cameraBanCursor] = { address, GetTickCount() };
-        g_cameraBanCursor = (g_cameraBanCursor + 1) % (sizeof(g_cameraBans) / sizeof(g_cameraBans[0]));
-    }
-
-    bool TryCaptureClientCameraAt(uintptr_t cameraAddress, uintptr_t source, std::uint32_t offset, std::uint32_t channel, PlayerPositionCandidate& best)
-    {
-        if (!IsLikelyRuntimePointer(cameraAddress))
-            return false;
-
-        if (IsCameraAddressBanned(cameraAddress))
-            return false;
-
-        std::int64_t x = 0;
-        std::int64_t y = 0;
-        std::int64_t z = 0;
-        if (!SafeReadValue(cameraAddress + 0x00, x) ||
-            !SafeReadValue(cameraAddress + 0x08, y) ||
-            !SafeReadValue(cameraAddress + 0x10, z))
-        {
-            return false;
-        }
-
-        const float worldX = FixedToWorld(x);
-        const float worldY = FixedToWorld(y);
-        const float worldZ = FixedToWorld(z);
-        if (!IsPlausibleWorldPosition(worldX, worldY, worldZ))
-            return false;
-
-        float orientation[4] = {};
-        if (!SafeRead(cameraAddress + 0x18, orientation, sizeof(orientation)))
-            return false;
-
-        const float quaternionLengthSquared =
-            orientation[0] * orientation[0] +
-            orientation[1] * orientation[1] +
-            orientation[2] * orientation[2] +
-            orientation[3] * orientation[3];
-        if (!std::isfinite(quaternionLengthSquared) || quaternionLengthSquared < 0.35f || quaternionLengthSquared > 1.75f)
-            return false;
-
-        float distance = 0.0f;
-        float fovY = 0.0f;
-        float aspect = 0.0f;
-        float nearPlane = 0.0f;
-        float farPlane = 0.0f;
-        if (!SafeReadValue(cameraAddress + 0x28, distance) ||
-            !SafeReadValue(cameraAddress + 0x2C, fovY) ||
-            !SafeReadValue(cameraAddress + 0x30, aspect) ||
-            !SafeReadValue(cameraAddress + 0x34, nearPlane) ||
-            !SafeReadValue(cameraAddress + 0x38, farPlane))
-        {
-            return false;
-        }
-
-        if (!std::isfinite(distance) || !std::isfinite(fovY) || !std::isfinite(aspect) ||
-            !std::isfinite(nearPlane) || !std::isfinite(farPlane))
-        {
-            return false;
-        }
-
-        if (distance < 0.0f || distance > 512.0f ||
-            fovY < 0.10f || fovY > 3.20f ||
-            aspect < 0.35f || aspect > 5.00f ||
-            nearPlane < 0.0f || nearPlane > 32.0f ||
-            farPlane <= nearPlane + 1.0f || farPlane < 16.0f || farPlane > 10000000.0f)
-        {
-            return false;
-        }
-
-        float score = 0.0f;
-        if (!TryScoreCameraPosition(worldX, worldZ, offset, score))
-            return false;
-
-        if (!best.valid || score < best.score)
-        {
-            const float invLength = 1.0f / std::sqrt(quaternionLengthSquared);
-            float normalized[4] = {
-                orientation[0] * invLength,
-                orientation[1] * invLength,
-                orientation[2] * invLength,
-                orientation[3] * invLength
-            };
-
-            best.x = x;
-            best.y = y;
-            best.z = z;
-            best.source = source;
-            best.offset = offset;
-            best.channel = channel;
-            best.score = score;
-            best.headingRadians = QuaternionYawFromMemory(normalized);
-            best.hasHeading = std::isfinite(best.headingRadians);
-            best.valid = true;
-        }
-
-        return true;
-    }
-
-    bool TryCaptureCameraPositionFromBlock(uintptr_t base, std::uint32_t channel, std::size_t scanBytes, PlayerPositionCandidate& best)
-    {
-        if (!IsLikelyRuntimePointer(base) || scanBytes < CLIENT_CAMERA_SIZE)
-            return false;
-
-        bool captured = false;
-        for (std::size_t offset = 0; offset + CLIENT_CAMERA_SIZE <= scanBytes; offset += sizeof(uintptr_t))
-        {
-            captured = TryCaptureClientCameraAt(base + offset, base, static_cast<std::uint32_t>(offset), channel, best) || captured;
-        }
-
-        return captured;
     }
 
     bool PublishBestPlayerPosition(const PlayerPositionCandidate& best)
@@ -3456,513 +3154,10 @@ namespace
         position.source = best.source;
         position.offset = best.offset;
         position.channel = best.channel;
-        position.headingRadians = best.headingRadians;
-        position.hasHeading = best.hasHeading;
         position.lastUpdateTick = GetTickCount();
         position.valid = true;
         PublishPlayerPosition(position);
         return true;
-    }
-
-    bool TryRefreshPlayerPositionFromCachedCamera()
-    {
-        {
-            // While the background camera hold is feeding fresh heading updates, the
-            // per-frame read is pointless: on the May-24-2026 client the camera block
-            // reads as zeroes at the fixed points of the frame where our hooks run.
-            std::lock_guard<std::mutex> lock(g_playerPositionMutex);
-            if (g_playerPosition.valid && g_playerPosition.hasHeading && g_playerPosition.channel == 29 &&
-                GetTickCount() - g_playerPosition.lastUpdateTick < 2000)
-            {
-                return true;
-            }
-        }
-
-        const uintptr_t cachedCamera = g_playerCameraAddress.load();
-        if (!IsLikelyRuntimePointer(cachedCamera))
-            return false;
-
-        PlayerPositionCandidate best{};
-        if (!TryCaptureClientCameraAt(cachedCamera, cachedCamera, 0, 20, best))
-        {
-            if (g_debugLoggingEnabled.load())
-            {
-                static std::atomic<DWORD> lastRejectLogTick{ 0 };
-                const DWORD now = GetTickCount();
-                const DWORD last = lastRejectLogTick.load();
-                if (last == 0 || now - last >= 5000)
-                {
-                    lastRejectLogTick.store(now);
-                    std::int64_t rawPos[3] = {};
-                    float rawFloats[9] = {};
-                    const bool posOk = SafeRead(cachedCamera, rawPos, sizeof(rawPos));
-                    const bool floatsOk = SafeRead(cachedCamera + 0x18, rawFloats, sizeof(rawFloats));
-                    std::ostringstream oss;
-                    oss << "[Minimap] cached camera rejected | addr=" << Hex(cachedCamera)
-                        << " | pos_read=" << (posOk ? "ok" : "fail")
-                        << " | floats_read=" << (floatsOk ? "ok" : "fail");
-                    if (posOk)
-                    {
-                        oss << " | world=(" << FixedToWorld(rawPos[0]) << ", "
-                            << FixedToWorld(rawPos[1]) << ", " << FixedToWorld(rawPos[2]) << ")";
-                    }
-                    if (floatsOk)
-                    {
-                        const float quatNormSq = rawFloats[0] * rawFloats[0] + rawFloats[1] * rawFloats[1] +
-                            rawFloats[2] * rawFloats[2] + rawFloats[3] * rawFloats[3];
-                        oss << " | quat_norm_sq=" << quatNormSq
-                            << " | dist=" << rawFloats[4] << " | fov=" << rawFloats[5]
-                            << " | aspect=" << rawFloats[6] << " | near=" << rawFloats[7]
-                            << " | far=" << rawFloats[8];
-                    }
-                    Log(oss.str());
-                }
-            }
-            g_playerCameraAddress.store(0);
-            return false;
-        }
-
-        // Evict decoy blocks: a real camera changes (position or orientation) over time.
-        {
-            const DWORD now = GetTickCount();
-            std::lock_guard<std::mutex> lock(g_cameraBanMutex);
-            const bool sameSource = g_lastCachedCameraSample.source == cachedCamera;
-            const bool sameData =
-                sameSource &&
-                g_lastCachedCameraSample.x == best.x &&
-                g_lastCachedCameraSample.y == best.y &&
-                g_lastCachedCameraSample.z == best.z &&
-                g_lastCachedCameraSample.headingRadians == best.headingRadians;
-            if (!sameData)
-            {
-                g_lastCachedCameraSample.source = cachedCamera;
-                g_lastCachedCameraSample.x = best.x;
-                g_lastCachedCameraSample.y = best.y;
-                g_lastCachedCameraSample.z = best.z;
-                g_lastCachedCameraSample.headingRadians = best.headingRadians;
-                g_cachedCameraLastChangeTick = now;
-            }
-            else if (now - g_cachedCameraLastChangeTick > CAMERA_FROZEN_EVICT_MS)
-            {
-                g_cameraBans[g_cameraBanCursor] = { cachedCamera, now };
-                g_cameraBanCursor = (g_cameraBanCursor + 1) % (sizeof(g_cameraBans) / sizeof(g_cameraBans[0]));
-                g_playerCameraAddress.store(0);
-                Log("[Minimap] cached camera frozen for 20s; banning block and rescanning");
-                return false;
-            }
-        }
-
-        return PublishBestPlayerPosition(best);
-    }
-
-    void ScanCameraRootWithLimits(
-        uintptr_t root,
-        PlayerPositionCandidate& best,
-        std::uint32_t rootChannel,
-        std::uint32_t childChannel,
-        std::size_t rootScanBytes,
-        std::size_t pointerScanBytes,
-        std::size_t childScanBytes)
-    {
-        if (!IsLikelyRuntimePointer(root))
-            return;
-
-        TryCaptureCameraPositionFromBlock(root, rootChannel, rootScanBytes, best);
-
-        for (std::size_t pointerOffset = 0; pointerOffset + sizeof(uintptr_t) <= pointerScanBytes; pointerOffset += sizeof(uintptr_t))
-        {
-            uintptr_t child = 0;
-            if (!SafeReadValue(root + pointerOffset, child) || !IsLikelyRuntimePointer(child))
-                continue;
-
-            TryCaptureCameraPositionFromBlock(child, childChannel, childScanBytes, best);
-        }
-    }
-
-    void ScanCameraRoot(uintptr_t root, PlayerPositionCandidate& best)
-    {
-        ScanCameraRootWithLimits(
-            root,
-            best,
-            21,
-            22,
-            PLAYER_CAMERA_ROOT_SCAN_BYTES,
-            PLAYER_CAMERA_POINTER_SCAN_BYTES,
-            PLAYER_CAMERA_CHILD_SCAN_BYTES);
-    }
-
-    bool TryCapturePlayerCameraFromRenderRoots()
-    {
-        const DWORD now = GetTickCount();
-        if (now - g_lastRenderCameraScanTick < RENDER_CAMERA_SCAN_INTERVAL_MS)
-            return false;
-
-        g_lastRenderCameraScanTick = now;
-
-        PlayerPositionCandidate best{};
-        const std::array<uintptr_t, 3> roots = {
-            g_lastRenderContext.load(),
-            g_lastGraphicsContext.load(),
-            g_lastSwapchainState.load()
-        };
-
-        for (uintptr_t root : roots)
-        {
-            ScanCameraRootWithLimits(
-                root,
-                best,
-                24,
-                25,
-                RENDER_CAMERA_ROOT_SCAN_BYTES,
-                RENDER_CAMERA_POINTER_SCAN_BYTES,
-                RENDER_CAMERA_CHILD_SCAN_BYTES);
-        }
-
-        if (!best.valid)
-            return false;
-
-        const uintptr_t cameraAddress = best.source + best.offset;
-        if (IsLikelyRuntimePointer(cameraAddress))
-            g_playerCameraAddress.store(cameraAddress);
-
-        return PublishBestPlayerPosition(best);
-    }
-
-    // Full-process camera hunt for the May-24-2026 client, where the live camera block
-    // (fixed pos + quaternion + dist/fov/aspect/near/far) lives in a heap allocation that
-    // is not reachable from any iterator record. Verified live: such a block exists and
-    // its quaternion tracks mouse look. Runs on a background thread, promotes only
-    // candidates that actually change between two samples (liveness), so static decoys
-    // are never promoted.
-    std::atomic<bool> g_cameraScanBusy{ false };
-    std::atomic<DWORD> g_lastCameraSigScanTick{ 0 };
-
-    void RunCameraSignatureScan()
-    {
-        constexpr float ASPECT_LO = 1.15f;
-        constexpr float ASPECT_HI = 2.70f;
-        constexpr std::size_t CHUNK = 0x10000;
-        constexpr std::size_t CAMERA_BYTES = 0x40;
-
-        std::vector<uintptr_t> candidates;
-        std::vector<std::uint8_t> buffer(CHUNK);
-        std::uint64_t scannedBytes = 0;
-
-        MEMORY_BASIC_INFORMATION mbi{};
-        uintptr_t address = 0x10000;
-        while (address < 0x00007FFFFFFF0000ULL && candidates.size() < 64)
-        {
-            if (VirtualQuery(reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi)) == 0)
-                break;
-
-            const uintptr_t regionBase = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
-            const std::size_t regionSize = mbi.RegionSize;
-            const bool scannable =
-                mbi.State == MEM_COMMIT &&
-                mbi.Type == MEM_PRIVATE &&
-                (mbi.Protect == PAGE_READWRITE || mbi.Protect == PAGE_EXECUTE_READWRITE) &&
-                regionSize <= 0x40000000;
-
-            if (scannable)
-            {
-                std::size_t pos = 0;
-                while (pos < regionSize && candidates.size() < 64)
-                {
-                    const std::size_t chunk = MinValue<std::size_t>(CHUNK, regionSize - pos);
-                    if (chunk >= CAMERA_BYTES && SafeRead(regionBase + pos, buffer.data(), chunk))
-                    {
-                        scannedBytes += chunk;
-                        for (std::size_t offset = 0; offset + CAMERA_BYTES <= chunk; offset += sizeof(std::uint64_t))
-                        {
-                            float aspect = 0.0f;
-                            float fov = 0.0f;
-                            std::memcpy(&aspect, buffer.data() + offset + 0x30, sizeof(aspect));
-                            if (!(aspect >= ASPECT_LO && aspect <= ASPECT_HI))
-                                continue;
-
-                            std::memcpy(&fov, buffer.data() + offset + 0x2C, sizeof(fov));
-                            if (!(fov >= 0.10f && fov <= 3.20f))
-                                continue;
-
-                            // Validate from the bytes already read: re-reading the block
-                            // live can land in the zeroed frame phase and silently drop
-                            // real candidates (this caused minutes-long rotation delays).
-                            const std::uint8_t* block = buffer.data() + offset;
-                            std::int64_t bx = 0;
-                            std::int64_t by = 0;
-                            std::int64_t bz = 0;
-                            std::memcpy(&bx, block + 0x00, sizeof(bx));
-                            std::memcpy(&by, block + 0x08, sizeof(by));
-                            std::memcpy(&bz, block + 0x10, sizeof(bz));
-                            const float wx = FixedToWorld(bx);
-                            const float wy = FixedToWorld(by);
-                            const float wz = FixedToWorld(bz);
-                            if (!IsPlausibleWorldPosition(wx, wy, wz))
-                                continue;
-
-                            float quat[4] = {};
-                            std::memcpy(quat, block + 0x18, sizeof(quat));
-                            const float quatNormSq = quat[0] * quat[0] + quat[1] * quat[1] + quat[2] * quat[2] + quat[3] * quat[3];
-                            if (!std::isfinite(quatNormSq) || quatNormSq < 0.35f || quatNormSq > 1.75f)
-                                continue;
-
-                            float dist = 0.0f;
-                            float nearPlane = 0.0f;
-                            float farPlane = 0.0f;
-                            std::memcpy(&dist, block + 0x28, sizeof(dist));
-                            std::memcpy(&nearPlane, block + 0x34, sizeof(nearPlane));
-                            std::memcpy(&farPlane, block + 0x38, sizeof(farPlane));
-                            if (!std::isfinite(dist) || dist < 0.0f || dist > 512.0f ||
-                                !std::isfinite(nearPlane) || nearPlane < 0.0f || nearPlane > 32.0f ||
-                                !std::isfinite(farPlane) || farPlane <= nearPlane + 1.0f || farPlane > 1e7f)
-                            {
-                                continue;
-                            }
-
-                            candidates.push_back(regionBase + pos + offset);
-                        }
-                    }
-
-                    // Overlap chunk edges so a block straddling the boundary is still seen.
-                    pos += chunk >= CHUNK ? CHUNK - CAMERA_BYTES : chunk;
-                }
-            }
-
-            address = regionBase + regionSize;
-        }
-
-        struct CameraSample
-        {
-            std::int64_t position[3] = {};
-            float quaternion[4] = {};
-            bool valid = false;
-        };
-
-        const auto sampleCamera = [](uintptr_t cameraAddress)
-        {
-            CameraSample sample{};
-            sample.valid =
-                SafeRead(cameraAddress, sample.position, sizeof(sample.position)) &&
-                SafeRead(cameraAddress + 0x18, sample.quaternion, sizeof(sample.quaternion));
-            return sample;
-        };
-
-        // The player's own position (exact UI-state feed) anchors candidate selection:
-        // the real camera always hovers within a couple hundred units of the player,
-        // while stale snapshot copies elsewhere in the heap do not.
-        float playerX = 0.0f;
-        float playerZ = 0.0f;
-        bool havePlayer = false;
-        {
-            std::lock_guard<std::mutex> lock(g_playerPositionMutex);
-            if (g_playerPosition.valid && GetTickCount() - g_playerPosition.lastUpdateTick < 5000)
-            {
-                playerX = FixedToWorld(g_playerPosition.x);
-                playerZ = FixedToWorld(g_playerPosition.z);
-                havePlayer = true;
-            }
-        }
-
-        const auto nearPlayer = [&](const CameraSample& sample)
-        {
-            if (!havePlayer)
-                return true;
-            const float dx = static_cast<float>(sample.position[0] * FIXED_32_32_TO_WORLD) - playerX;
-            const float dz = static_cast<float>(sample.position[2] * FIXED_32_32_TO_WORLD) - playerZ;
-            return dx * dx + dz * dz < 200.0f * 200.0f;
-        };
-
-        std::vector<CameraSample> firstSamples;
-        firstSamples.reserve(candidates.size());
-        for (uintptr_t candidate : candidates)
-            firstSamples.push_back(sampleCamera(candidate));
-
-        Sleep(400);
-
-        std::vector<uintptr_t> liveCandidates;
-        std::vector<uintptr_t> nearCandidates;
-        uintptr_t promoted = 0;
-        uintptr_t promotedAnyChange = 0;
-        for (std::size_t index = 0; index < candidates.size(); ++index)
-        {
-            if (!firstSamples[index].valid)
-                continue;
-
-            // Near-player filtering moved to the hold loop: async samples here can hit
-            // the zeroed frame phase and reject the real camera by mistake.
-            nearCandidates.push_back(candidates[index]);
-
-            const CameraSample second = sampleCamera(candidates[index]);
-            if (!second.valid)
-                continue;
-
-            const bool quatChanged =
-                std::memcmp(second.quaternion, firstSamples[index].quaternion, sizeof(second.quaternion)) != 0;
-            const bool posChanged =
-                std::memcmp(second.position, firstSamples[index].position, sizeof(second.position)) != 0;
-
-            // A rotating quaternion is the strongest signal of the live view camera;
-            // transient copies get written once and then freeze.
-            if (quatChanged)
-            {
-                liveCandidates.insert(liveCandidates.begin(), candidates[index]);
-                if (promoted == 0)
-                    promoted = candidates[index];
-            }
-            else if (posChanged)
-            {
-                liveCandidates.push_back(candidates[index]);
-                if (promotedAnyChange == 0)
-                    promotedAnyChange = candidates[index];
-            }
-        }
-
-        if (promoted == 0)
-            promoted = promotedAnyChange;
-
-        // Multiplayer: other players' cameras also live in memory near ours. Prefer the
-        // live candidate closest to the local player's exact position so the map does
-        // not lock onto a remote player's view (which oscillated the heading when a
-        // second player looked around). Order liveCandidates by that distance too, so
-        // the hold loop's fallbacks stay local-first.
-        if (havePlayer && !liveCandidates.empty())
-        {
-            const auto distToPlayer = [&](uintptr_t addr)
-            {
-                const CameraSample s = sampleCamera(addr);
-                if (!s.valid)
-                    return 1e30f;
-                const float dx = static_cast<float>(s.position[0] * FIXED_32_32_TO_WORLD) - playerX;
-                const float dz = static_cast<float>(s.position[2] * FIXED_32_32_TO_WORLD) - playerZ;
-                return dx * dx + dz * dz;
-            };
-            std::sort(liveCandidates.begin(), liveCandidates.end(), [&](uintptr_t a, uintptr_t b)
-            {
-                return distToPlayer(a) < distToPlayer(b);
-            });
-            promoted = liveCandidates.front();
-        }
-
-        // If nothing moved during the short probe (player standing still, not turning),
-        // keep watching the near-player candidates for a while instead of giving up:
-        // the moment the player rotates the view, the real camera's quaternion changes
-        // and it gets promoted immediately. This removes the minutes-long wait for a
-        // scan to happen to coincide with camera movement.
-        if (liveCandidates.empty() && !nearCandidates.empty())
-        {
-            std::vector<CameraSample> watchSamples;
-            watchSamples.reserve(nearCandidates.size());
-            for (uintptr_t candidate : nearCandidates)
-                watchSamples.push_back(sampleCamera(candidate));
-
-            const DWORD watchStart = GetTickCount();
-            while (GetTickCount() - watchStart < 45000 && g_worldSessionReady.load())
-            {
-                Sleep(200);
-                for (std::size_t index = 0; index < nearCandidates.size(); ++index)
-                {
-                    const CameraSample current = sampleCamera(nearCandidates[index]);
-                    if (!current.valid || !watchSamples[index].valid)
-                        continue;
-
-                    // Any change counts: walking moves the camera even without mouse
-                    // look, so acquisition happens within the player's first steps. The
-                    // hold loop's near-player and liveness checks weed out impostors.
-                    if (std::memcmp(current.quaternion, watchSamples[index].quaternion, sizeof(current.quaternion)) != 0 ||
-                        std::memcmp(current.position, watchSamples[index].position, sizeof(current.position)) != 0)
-                    {
-                        promoted = nearCandidates[index];
-                        liveCandidates.push_back(promoted);
-                        break;
-                    }
-                }
-                if (promoted != 0)
-                    break;
-            }
-        }
-
-        if (promoted != 0)
-            g_playerCameraAddress.store(promoted);
-
-        std::ostringstream oss;
-        oss << "[Minimap] camera signature scan"
-            << " | scanned=" << (scannedBytes >> 20) << "MB"
-            << " | candidates=" << candidates.size()
-            << " | live=" << liveCandidates.size()
-            << " | near_player_anchor=" << (havePlayer ? "yes" : "no")
-            << " | promoted=" << Hex(promoted);
-        Log(oss.str());
-
-        // Some blocks that pass the signature check are per-frame scratch buffers: the
-        // game rewrites them several times per frame, so reads from the fixed per-frame
-        // hooks land on garbage even though asynchronous reads (like this thread's)
-        // often see a valid camera. Instead of relying on the frame hooks, keep holding
-        // the promoted candidates from this thread and publish every successful
-        // asynchronous read; fall over to the next candidate when one stops validating.
-        const DWORD holdStart = GetTickCount();
-        std::size_t candidateIndex = 0;
-        DWORD lastSuccessTick = GetTickCount();
-        DWORD lastRotateTick = GetTickCount();
-        std::uint32_t publishes = 0;
-        while (!liveCandidates.empty() && GetTickCount() - holdStart < 300000 && g_worldSessionReady.load())
-        {
-            const DWORD now = GetTickCount();
-            if (now - lastSuccessTick > 10000)
-                break;
-
-            const uintptr_t cameraAddress = liveCandidates[candidateIndex % liveCandidates.size()];
-            PlayerPositionCandidate probe{};
-            if (TryCaptureClientCameraAt(cameraAddress, cameraAddress, 0, 29, probe))
-            {
-                // The local view camera sits right on the local player; a valid block
-                // offset from the exact position is another player's camera (multiplayer)
-                // — rotate to the next candidate. Tight leash so a teammate standing a
-                // few tens of metres away can't hijack the heading.
-                bool nearPlayerNow = true;
-                {
-                    std::lock_guard<std::mutex> lock(g_playerPositionMutex);
-                    if (g_lastExactPosition.valid && GetTickCount() - g_lastExactPosition.lastUpdateTick < 3000)
-                    {
-                        const float dx = FixedToWorld(probe.x) - FixedToWorld(g_lastExactPosition.x);
-                        const float dz = FixedToWorld(probe.z) - FixedToWorld(g_lastExactPosition.z);
-                        nearPlayerNow = dx * dx + dz * dz < 90.0f * 90.0f;
-                    }
-                }
-
-                // Guard against half-written scratch data: the block must read back
-                // nearly the same position on an immediate second read. Exact equality
-                // rejected almost every sample while the camera was moving, which is when
-                // the view direction matters most, so allow a small drift.
-                std::int64_t verify[3] = {};
-                const bool verified = nearPlayerNow &&
-                    SafeRead(cameraAddress, verify, sizeof(verify)) &&
-                    std::fabs(FixedToWorld(verify[0]) - FixedToWorld(probe.x)) < 3.0f &&
-                    std::fabs(FixedToWorld(verify[1]) - FixedToWorld(probe.y)) < 3.0f &&
-                    std::fabs(FixedToWorld(verify[2]) - FixedToWorld(probe.z)) < 3.0f;
-                if (verified)
-                {
-                    g_playerCameraAddress.store(cameraAddress);
-                    PublishBestPlayerPosition(probe);
-                    ++publishes;
-                    lastSuccessTick = now;
-                }
-            }
-            else if (now - lastRotateTick > 3000)
-            {
-                ++candidateIndex;
-                lastRotateTick = now;
-            }
-
-            Sleep(3);
-        }
-
-        if (publishes != 0)
-        {
-            std::ostringstream holdLog;
-            holdLog << "[Minimap] camera hold finished | publishes=" << publishes
-                << " | held_for_ms=" << (GetTickCount() - holdStart);
-            Log(holdLog.str());
-        }
     }
 
     // ---- BEGIN LIVE POSITION TRACKER ----
@@ -4185,7 +3380,7 @@ namespace
 
         MEMORY_BASIC_INFORMATION mbi{};
         uintptr_t address = 0x10000;
-        while (address < 0x00007FFFFFFF0000ULL && found.size() < maxCandidates && g_worldSessionReady.load())
+        while (address < 0x00007FFFFFFF0000ULL && found.size() < maxCandidates && MinimapRuntimeActive())
         {
             if (VirtualQuery(reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi)) == 0)
                 break;
@@ -4340,7 +3535,7 @@ namespace
         bool loggedMovers = false;
         bool forceExactReference = true;
 
-        while (g_worldSessionReady.load())
+        while (MinimapRuntimeActive())
         {
             if (UiLivePositionFresh())
             {
@@ -4740,7 +3935,7 @@ namespace
 
     void MaybeStartLivePositionTracker()
     {
-        if (!g_worldSessionReady.load() || UiLivePositionFresh())
+        if (!MinimapRuntimeActive() || UiLivePositionFresh())
             return;
 
         const DWORD now = GetTickCount();
@@ -4759,77 +3954,6 @@ namespace
         }).detach();
     }
     // ---- END LIVE POSITION TRACKER ----
-
-    void MaybeStartCameraSignatureScan()
-    {
-        if (!g_worldSessionReady.load())
-            return;
-
-        {
-            // A view direction arrived recently: nothing to find.
-            std::lock_guard<std::mutex> lock(g_playerPositionMutex);
-            if (g_lastHeadingTick != 0 && TicksSince(GetTickCount(), g_lastHeadingTick) < 1500)
-                return;
-        }
-
-        const DWORD now = GetTickCount();
-        const DWORD last = g_lastCameraSigScanTick.load();
-        if (last != 0 && now - last < 7000)
-            return;
-
-        if (g_cameraScanBusy.exchange(true))
-            return;
-
-        g_lastCameraSigScanTick.store(now);
-        std::thread([]()
-        {
-            RunCameraSignatureScan();
-            g_cameraScanBusy.store(false);
-        }).detach();
-    }
-
-    bool TryCapturePlayerCameraFromWaypointRecord(const WaypointsUiIterationRecord& record)
-    {
-        if (TryRefreshPlayerPositionFromCachedCamera())
-            return true;
-
-        const DWORD now = GetTickCount();
-        if (now - g_lastPlayerCameraScanTick < PLAYER_CAMERA_SCAN_INTERVAL_MS)
-            return false;
-
-        g_lastPlayerCameraScanTick = now;
-
-        PlayerPositionCandidate best{};
-        const std::array<uintptr_t, 6> roots = {
-            reinterpret_cast<uintptr_t>(record.unknown0),
-            reinterpret_cast<uintptr_t>(record.stateNew),
-            reinterpret_cast<uintptr_t>(record.state),
-            reinterpret_cast<uintptr_t>(record.lookupContext),
-            reinterpret_cast<uintptr_t>(record.waypointList),
-            reinterpret_cast<uintptr_t>(record.playerList)
-        };
-
-        for (uintptr_t root : roots)
-            ScanCameraRoot(root, best);
-
-        // Direct probe of the known UI-state camera block (both layouts) — the generic
-        // root scans only cover the first bytes of the state object and cannot reach it.
-        std::uint8_t* uiState = ResolveWaypointsUiState(record);
-        if (uiState != nullptr)
-        {
-            TryCaptureCameraPositionFromBlock(reinterpret_cast<uintptr_t>(uiState + UI_STATE_CAMERA_BLOCK_NEW - 0x40), 26, 0x1C0, best);
-            TryCaptureCameraPositionFromBlock(reinterpret_cast<uintptr_t>(uiState + UI_STATE_CAMERA_BLOCK_OLD - 0x40), 27, 0x1C0, best);
-        }
-
-        if (!best.valid)
-            return false;
-
-        const uintptr_t cameraAddress = best.source + best.offset;
-        if (IsLikelyRuntimePointer(cameraAddress))
-            g_playerCameraAddress.store(cameraAddress);
-
-        return PublishBestPlayerPosition(best);
-    }
 
     bool SameMarkerPosition(const CapturedNearbyMarker& left, const CapturedNearbyMarker& right)
     {
@@ -5238,6 +4362,27 @@ namespace
                 }
                 oss << rawSamples;
                 Log(oss.str());
+
+                // Where the icon-less markers (NPC candidates) are, once a minute.
+                static std::atomic<DWORD> lastNpcDumpTick{ 0 };
+                if (lastNpcDumpTick.load() == 0 || now - lastNpcDumpTick.load() >= 60000)
+                {
+                    lastNpcDumpTick.store(now);
+                    std::ostringstream npc;
+                    npc << "[Minimap] npc-like markers";
+                    int logged = 0;
+                    for (const CapturedMasterMarker& marker : markers)
+                    {
+                        if (marker.key != 0 && !IsIconlessMapMarkerKey(marker.key))
+                            continue;
+                        npc << " | " << Hex(marker.key) << "@(" << static_cast<int>(FixedToWorld(marker.x))
+                            << "," << static_cast<int>(FixedToWorld(marker.z)) << ")"
+                            << (marker.moving ? " moving" : "");
+                        if (++logged >= 40)
+                            break;
+                    }
+                    Log(npc.str());
+                }
             }
         }
 
@@ -5388,12 +4533,22 @@ namespace
     {
         __try
         {
+            // The query cursor lives in the game's iteration context (ctx+0x08), and
+            // iter_init only clears the record: it never rewinds the cursor. The entity we
+            // pull here would otherwise be skipped by the game's own loop right after this
+            // hook, and with two matching entities its iter_next walks strides from a
+            // zeroed record and faults (crash seen in local_player_ui_render_setup while
+            // hosting). Put the cursor back exactly where the game expects it.
+            auto* cursor = reinterpret_cast<std::uint32_t*>(static_cast<std::uint8_t*>(ctx) + 0x08);
+            const std::uint32_t savedCursor = *cursor;
             g_iterInit(ctx, &record, static_cast<std::uint32_t>(sizeof(record)));
             // May-24-2026 client: iter_init only prepares the cursor; fields are filled by
             // the first iter_next (matches the game's own call sequence at this hook).
+            bool ok = true;
             if ((record.source == nullptr || record.state == nullptr) && g_iterNext != nullptr)
-                return g_iterNext(ctx, &record, static_cast<std::uint32_t>(sizeof(record)));
-            return true;
+                ok = g_iterNext(ctx, &record, static_cast<std::uint32_t>(sizeof(record)));
+            *cursor = savedCursor;
+            return ok;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -6807,10 +5962,14 @@ namespace
     }
     // ---- END PING HUNT ----
 
+    // The memory hunts found the player list and the ping queue (9/18); they stay in the
+    // source for future game updates but are off, since each scan costs seconds of CPU.
+    constexpr bool MEMORY_HUNTS_ENABLED = false;
+
     void RunRemotePlayerProbe(std::uint8_t* state)
     {
         (void)state;
-        if (!g_debugLoggingEnabled.load() || !g_worldSessionReady.load())
+        if (!MEMORY_HUNTS_ENABLED || !g_debugLoggingEnabled.load() || !MinimapRuntimeActive())
             return;
 
         const DWORD now = GetTickCount();
@@ -6921,7 +6080,6 @@ namespace
         if (!TryInitWaypointRecord(ctx, record))
             return false;
 
-        TryCapturePlayerCameraFromWaypointRecord(record);
 
         std::uint8_t* state = ResolveWaypointsUiState(record);
         if (state == nullptr)
@@ -6929,25 +6087,34 @@ namespace
         if (!AcceptUiState(state))
             return false;
 
-        // The view-direction search normally starts from Update(); start it from here as
-        // well so a stalled Shroudtopia update loop cannot freeze the player arrow.
-        MaybeStartCameraSignatureScan();
-
-        // Keep the position feed alive from this per-frame hook as well; the publish
-        // gate keeps heading-bearing camera positions authoritative when present.
+        // Keep the position feed alive from this per-frame hook as well.
         TryPublishExactUiStatePosition(state);
 
-        // The master marker array is what the big map renders; mirror it every frame.
-        TryCaptureMasterMarkers(state);
-        TryCaptureRemotePlayers(state);
-        LogRemotePlayersIfDue();
-        RunRemotePlayerProbe(state);
+        // Everything below mirrors slow-moving world data (the master marker array is a
+        // ~400 KB copy plus track matching; the player list and the streamed marker lists
+        // are more of the same). This hook runs on the game's main thread every frame, so
+        // it is capped at 20 Hz - well above what a marker or a teammate dot needs, and it
+        // takes the cost off the frame that is already busy. The player position and the
+        // camera heading above stay at full frame rate.
+        {
+            static DWORD lastSlowCaptureTick = 0;
+            const DWORD nowTick = GetTickCount();
+            if (lastSlowCaptureTick == 0 || nowTick - lastSlowCaptureTick >= 50)
+            {
+                lastSlowCaptureTick = nowTick;
 
-        std::vector<CapturedNearbyMarker> nearbyMarkers;
-        AppendNearbyMarkersFromState(state, nearbyMarkers);
-        AppendNearbyMarkersFromInputList(record.waypointList, nearbyMarkers, 2);
-        AppendNearbyMarkersFromInputList(record.playerList, nearbyMarkers, 3);
-        PublishNearbyMarkers(std::move(nearbyMarkers));
+                TryCaptureMasterMarkers(state);
+                TryCaptureRemotePlayers(state);
+                LogRemotePlayersIfDue();
+                RunRemotePlayerProbe(state);
+
+                std::vector<CapturedNearbyMarker> nearbyMarkers;
+                AppendNearbyMarkersFromState(state, nearbyMarkers);
+                AppendNearbyMarkersFromInputList(record.waypointList, nearbyMarkers, 2);
+                AppendNearbyMarkersFromInputList(record.playerList, nearbyMarkers, 3);
+                PublishNearbyMarkers(std::move(nearbyMarkers));
+            }
+        }
 
         WaypointBlockLayout layout{};
         std::uint8_t* entries = nullptr;
@@ -7012,11 +6179,15 @@ namespace
 
     void __fastcall CaptureUiRenderSetupHook(void* ctx, void*, void*, void*)
     {
+        if (!g_minimapEnabled.load())
+            return;
         TryCaptureUiRenderSetup(ctx);
     }
 
     void __fastcall CaptureWaypointsHook(void* ctx, void*, void*, void*)
     {
+        if (!g_minimapEnabled.load())
+            return;
         if (!TryCaptureWaypointsFromPlayerWaypointsUi(ctx))
         {
             const DWORD now = GetTickCount();
@@ -7573,6 +6744,7 @@ namespace
     std::string GetExecutableDirectory();
     void EnsureMinimapFrameLoaded();
     void EnsureRealMapLoaded();
+    void ReleaseRealMapCpuCopy();
     void EnsureMinimapIconsLoaded();
     // Screen-space rotation direction of embervale_minimap_frame.vert.spv relative to a
     // clockwise (y-down) rotation; verified in the SwiftShader harness.
@@ -7939,6 +7111,7 @@ namespace
     constexpr std::uint32_t SPRITE_KEY_ALLY = 0xFFFFFF02u;
     constexpr std::uint32_t SPRITE_KEY_NPC = 0xFFFFFF03u;
     constexpr std::uint32_t SPRITE_KEY_WAYPOINT_RING = 0xFFFFFF04u;
+    constexpr std::uint32_t SPRITE_KEY_PLAYER_DOT = 0xFFFFFF05u;   // us, with the heading off (F11)
     // One yellow silhouette per map icon: the icon's shape grown by a few pixels, drawn
     // under the icon so the waypoint highlight follows the icon's outline.
     constexpr std::uint32_t SPRITE_KEY_SILHOUETTE_BASE = 0xFFFE0000u;
@@ -8406,55 +7579,92 @@ namespace
     }
 
     // Dot with a thin dark rim (sky blue: other players, yellow: NPCs).
-    // The game marks the active waypoint with a yellow ring around the icon that sits
-    // there; the ring is drawn on its own when no icon shares the spot.
-    // Grows the icon's alpha with a separable max filter and paints it yellow.
-    SpriteImage BuildIconSilhouette(std::uint32_t key, const std::vector<std::uint8_t>& rgba, std::uint32_t width, std::uint32_t height)
+    int IconSilhouetteRadius(std::uint32_t width, std::uint32_t height)
     {
+        return ClampValue(static_cast<int>(MaxValue(width, height)) / 14, 4, 12);
+    }
+
+    // The silhouette canvas is padded by this much on every side, so the outline of an
+    // icon that fills its texture (the waypoint diamond) is not cut off at the edges.
+    std::uint32_t IconSilhouettePadding(std::uint32_t width, std::uint32_t height)
+    {
+        return static_cast<std::uint32_t>(IconSilhouetteRadius(width, height)) + 2;
+    }
+
+    SpriteImage BuildIconSilhouette(std::uint32_t key, const std::vector<std::uint8_t>& rgba, std::uint32_t sourceWidth, std::uint32_t sourceHeight)
+    {
+        const std::uint32_t pad = IconSilhouettePadding(sourceWidth, sourceHeight);
+        const std::uint32_t width = sourceWidth + pad * 2;
+        const std::uint32_t height = sourceHeight + pad * 2;
         SpriteImage image{ key, width, height, std::vector<std::uint8_t>(static_cast<std::size_t>(width) * height * 4, 0) };
-        if (rgba.size() < static_cast<std::size_t>(width) * height * 4 || width == 0 || height == 0)
+        if (rgba.size() < static_cast<std::size_t>(sourceWidth) * sourceHeight * 4 || sourceWidth == 0 || sourceHeight == 0)
             return image;
 
-        const int radius = ClampValue(static_cast<int>(MaxValue(width, height)) / 14, 4, 12);
-        std::vector<std::uint8_t> alpha(static_cast<std::size_t>(width) * height, 0);
-        std::vector<std::uint8_t> grown(alpha.size(), 0);
-        for (std::size_t i = 0; i < alpha.size(); ++i)
-            alpha[i] = rgba[i * 4 + 3];
+        // Chamfer (3-4) distance to the nearest opaque pixel: a round outline that keeps
+        // the icon's shape (a box dilation turned the diamond into an octagon).
+        const float radius = static_cast<float>(IconSilhouetteRadius(sourceWidth, sourceHeight));
+        constexpr int UNREACHED = 1 << 20;   // (FAR/NEAR are windows.h macros)
+        std::vector<int> distance(static_cast<std::size_t>(width) * height, UNREACHED);
+        for (std::uint32_t y = 0; y < sourceHeight; ++y)
+        {
+            for (std::uint32_t x = 0; x < sourceWidth; ++x)
+            {
+                if (rgba[(static_cast<std::size_t>(y) * sourceWidth + x) * 4 + 3] >= 40)
+                    distance[static_cast<std::size_t>(y + pad) * width + (x + pad)] = 0;
+            }
+        }
+        const auto at = [&](std::uint32_t x, std::uint32_t y) -> int& { return distance[static_cast<std::size_t>(y) * width + x]; };
+        for (std::uint32_t y = 0; y < height; ++y)
+        {
+            for (std::uint32_t x = 0; x < width; ++x)
+            {
+                int best = at(x, y);
+                if (x > 0) best = MinValue(best, at(x - 1, y) + 3);
+                if (y > 0)
+                {
+                    best = MinValue(best, at(x, y - 1) + 3);
+                    if (x > 0) best = MinValue(best, at(x - 1, y - 1) + 4);
+                    if (x + 1 < width) best = MinValue(best, at(x + 1, y - 1) + 4);
+                }
+                at(x, y) = best;
+            }
+        }
+        for (std::uint32_t yy = height; yy-- > 0;)
+        {
+            for (std::uint32_t xx = width; xx-- > 0;)
+            {
+                int best = at(xx, yy);
+                if (xx + 1 < width) best = MinValue(best, at(xx + 1, yy) + 3);
+                if (yy + 1 < height)
+                {
+                    best = MinValue(best, at(xx, yy + 1) + 3);
+                    if (xx + 1 < width) best = MinValue(best, at(xx + 1, yy + 1) + 4);
+                    if (xx > 0) best = MinValue(best, at(xx - 1, yy + 1) + 4);
+                }
+                at(xx, yy) = best;
+            }
+        }
 
         for (std::uint32_t y = 0; y < height; ++y)
         {
             for (std::uint32_t x = 0; x < width; ++x)
             {
-                std::uint8_t best = 0;
-                const int from = MaxValue(0, static_cast<int>(x) - radius);
-                const int to = MinValue(static_cast<int>(width) - 1, static_cast<int>(x) + radius);
-                for (int sx = from; sx <= to; ++sx)
-                    best = MaxValue(best, alpha[static_cast<std::size_t>(y) * width + static_cast<std::size_t>(sx)]);
-                grown[static_cast<std::size_t>(y) * width + x] = best;
-            }
-        }
-        for (std::uint32_t x = 0; x < width; ++x)
-        {
-            for (std::uint32_t y = 0; y < height; ++y)
-            {
-                std::uint8_t best = 0;
-                const int from = MaxValue(0, static_cast<int>(y) - radius);
-                const int to = MinValue(static_cast<int>(height) - 1, static_cast<int>(y) + radius);
-                for (int sy = from; sy <= to; ++sy)
-                    best = MaxValue(best, grown[static_cast<std::size_t>(sy) * width + x]);
-                const std::size_t index = static_cast<std::size_t>(y) * width + x;
-                if (best == 0)
+                const float d = static_cast<float>(at(x, y)) / 3.0f;
+                const float coverage = ClampValue(radius + 0.5f - d, 0.0f, 1.0f);
+                if (coverage <= 0.0f)
                     continue;
+                const std::size_t index = static_cast<std::size_t>(y) * width + x;
                 image.rgba[index * 4 + 0] = 255;
                 image.rgba[index * 4 + 1] = 205;
                 image.rgba[index * 4 + 2] = 20;
-                // Solid outline: everything the icon covers, even faintly, turns opaque.
-                image.rgba[index * 4 + 3] = best >= 40 ? 255 : static_cast<std::uint8_t>(best * 6);
+                image.rgba[index * 4 + 3] = static_cast<std::uint8_t>(coverage * 255.0f + 0.5f);
             }
         }
         return image;
     }
 
+    // The game marks the active waypoint with a yellow ring around the icon that sits
+    // there; the ring is drawn on its own when no icon shares the spot.
     SpriteImage BuildWaypointRingSprite()
     {
         constexpr std::uint32_t S = 96;
@@ -8719,10 +7929,21 @@ namespace
             g_spriteAtlasRebuild.store(true);
         if (g_spriteAtlasRebuild.exchange(false) && (gp.ready || gp.attempted))
         {
-            // A new player name needs a new atlas; the old one may still be in flight.
-            if (renderer.device != 0 && renderer.fns.deviceWaitIdle != nullptr)
-                renderer.fns.deviceWaitIdle(reinterpret_cast<void*>(renderer.device));
-            DestroyGpuTexturePipelineLocked(renderer, gp);
+            // A new player name needs a new atlas. The old one may still be referenced by
+            // submitted command buffers, so it is parked and destroyed a few frames later
+            // instead of stalling the device (vkDeviceWaitIdle races the game's own
+            // submitting threads and can lose the device).
+            if (gp.ready)
+            {
+                RetiredGpuPipeline retired{};
+                retired.gp = gp;
+                renderer.retiredPipelines.push_back(std::move(retired));
+                gp = GpuTexturePipeline{};
+            }
+            else
+            {
+                DestroyGpuTexturePipelineLocked(renderer, gp);
+            }
             renderer.spriteRects.clear();
             gp.attempted = false;
             gp.ready = false;
@@ -8738,6 +7959,8 @@ namespace
 
         std::vector<SpriteImage> images;
         images.push_back(BuildPlayerSprite());
+        // Same lime fill and dark rim as the triangle.
+        images.push_back(BuildDotSprite(SPRITE_KEY_PLAYER_DOT, 0.62f, 0.95f, 0.22f, 0.06f, 0.16f, 0.04f));
         images.push_back(BuildDotSprite(SPRITE_KEY_ALLY, 0.40f, 0.80f, 1.00f, 0.03f, 0.10f, 0.16f));
         images.push_back(BuildDotSprite(SPRITE_KEY_NPC, 1.00f, 0.85f, 0.20f, 0.20f, 0.14f, 0.02f));
         images.push_back(BuildWaypointRingSprite());
@@ -8953,8 +8176,18 @@ namespace
         const GpuTexturePipeline& gp = renderer.spriteGpu;
         void* descriptorSet = reinterpret_cast<void*>(gp.descriptorSet);
         void* pipelineLayout = reinterpret_cast<void*>(gp.pipelineLayout);
-        renderer.fns.cmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, reinterpret_cast<void*>(gp.pipeline));
-        renderer.fns.cmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+        // Every icon, label and dot draws from the same pipeline and descriptor set;
+        // rebinding them per sprite is pure driver overhead (~100 sprites a frame).
+        if (renderer.boundPipeline != gp.pipeline)
+        {
+            renderer.fns.cmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, reinterpret_cast<void*>(gp.pipeline));
+            renderer.boundPipeline = gp.pipeline;
+        }
+        if (renderer.boundDescriptorSet != gp.descriptorSet)
+        {
+            renderer.fns.cmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+            renderer.boundDescriptorSet = gp.descriptorSet;
+        }
         renderer.fns.cmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, MINIMAP_MAP_PUSH_BYTES, push);
         renderer.fns.cmdDraw(commandBuffer, 6, 1, 0, 0);
         return true;
@@ -9042,7 +8275,41 @@ namespace
         for (GpuTexturePipeline* gp : { &renderer.mapGpu, &renderer.spriteGpu })
         {
             if (gp->stagingReleasePending && gp->uploadImageIndex == imageIndex)
+            {
                 ReleaseGpuTextureStagingLocked(renderer, *gp);
+                if (gp == &renderer.mapGpu && g_minimapMapGpuEnabled.load())
+                    ReleaseRealMapCpuCopy();
+            }
+        }
+    }
+
+    // Called once per recorded frame, after this image's fence has been waited on. A
+    // retired pipeline goes once every swapchain image has been re-recorded since it
+    // was parked: no submitted command buffer can still reference it by then.
+    void DestroyRetiredGpuPipelinesIfSafeLocked(VulkanMinimapRenderer& renderer, std::uint32_t imageIndex)
+    {
+        if (renderer.retiredPipelines.empty())
+            return;
+
+        const std::uint32_t imageCount = static_cast<std::uint32_t>(renderer.commandBuffers.size());
+        const std::uint32_t allImages = imageCount >= 32 ? 0xFFFFFFFFu : ((1u << imageCount) - 1u);
+        for (std::size_t i = 0; i < renderer.retiredPipelines.size();)
+        {
+            RetiredGpuPipeline& retired = renderer.retiredPipelines[i];
+            if (imageIndex < 32)
+                retired.seenImageMask |= (1u << imageIndex);
+            ++retired.records;
+            const bool cycled = (retired.seenImageMask & allImages) == allImages && retired.records > imageCount;
+            const bool stale = retired.records > 240;   // safety net if an image index never comes back
+            if (cycled || stale)
+            {
+                DestroyGpuTexturePipelineLocked(renderer, retired.gp);
+                renderer.retiredPipelines.erase(renderer.retiredPipelines.begin() + static_cast<std::ptrdiff_t>(i));
+            }
+            else
+            {
+                ++i;
+            }
         }
     }
 
@@ -9050,6 +8317,9 @@ namespace
     {
         DestroyGpuTexturePipelineLocked(renderer, renderer.mapGpu);
         DestroyGpuTexturePipelineLocked(renderer, renderer.spriteGpu);
+        for (RetiredGpuPipeline& retired : renderer.retiredPipelines)
+            DestroyGpuTexturePipelineLocked(renderer, retired.gp);
+        renderer.retiredPipelines.clear();
         renderer.spriteRects.clear();
     }
 
@@ -9094,6 +8364,7 @@ namespace
         void* descriptorSet = reinterpret_cast<void*>(gp.descriptorSet);
         void* pipelineLayout = reinterpret_cast<void*>(gp.pipelineLayout);
         renderer.fns.cmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, reinterpret_cast<void*>(gp.pipeline));
+        renderer.boundPipeline = gp.pipeline;
         renderer.fns.cmdBindDescriptorSets(
             commandBuffer,
             VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -9103,6 +8374,7 @@ namespace
             &descriptorSet,
             0,
             nullptr);
+        renderer.boundDescriptorSet = gp.descriptorSet;
         renderer.fns.cmdPushConstants(
             commandBuffer,
             pipelineLayout,
@@ -10152,6 +9424,38 @@ namespace
         return false;
     }
 
+    // Halves the loaded map until it is no larger than "map_texture_size". Averaging
+    // the alpha channel is fine: it holds the shroud signed distance.
+    void ShrinkRealMapToConfiguredSize(RealMapTexture& map)
+    {
+        const int target = g_minimapMapTextureSize.load();
+        while (map.loaded && map.width == map.height && map.width > target && (map.width % 2) == 0 && map.width >= 128)
+        {
+            const std::uint32_t srcSize = static_cast<std::uint32_t>(map.width);
+            const std::uint32_t dstSize = srcSize / 2;
+            std::vector<std::uint8_t> smaller(static_cast<std::size_t>(dstSize) * dstSize * 4);
+            DownsampleRgbaLevel(map.rgba.data(), srcSize, smaller.data(), dstSize);
+            map.rgba.swap(smaller);
+            map.width = static_cast<int>(dstSize);
+            map.height = static_cast<int>(dstSize);
+        }
+    }
+
+    // The CPU copy (268 MB at 8192) is only needed to fill the GPU staging buffer and
+    // for the CPU fallback renderer. Once the upload has finished it is dropped; a later
+    // renderer rebuild (resolution change) simply reloads it from disk.
+    void ReleaseRealMapCpuCopy()
+    {
+        std::lock_guard<std::mutex> lock(g_realMapMutex);
+        if (!g_realMap.loaded || g_realMap.rgba.empty())
+            return;
+        std::vector<std::uint8_t>().swap(g_realMap.rgba);
+        g_realMap.loaded = false;
+        g_realMap.attempted = false;
+        if (g_debugLoggingEnabled.load())
+            Log("[Minimap] released CPU map copy after GPU upload");
+    }
+
     void EnsureRealMapLoaded()
     {
         std::lock_guard<std::mutex> lock(g_realMapMutex);
@@ -10159,6 +9463,8 @@ namespace
             return;
 
         g_realMap.attempted = true;
+        g_realMap.loaded = false;
+        std::vector<std::uint8_t>().swap(g_realMap.rgba);
 
         std::vector<std::string> directories;
         if (g_modContext != nullptr && !g_modContext->shroudtopia.mod_folder.empty())
@@ -10188,6 +9494,7 @@ namespace
                     << " | size=" << g_realMap.width << "x" << g_realMap.height;
                 Log(oss.str());
                 TryApplyShroudSdf(directories, g_realMap);
+                ShrinkRealMapToConfiguredSize(g_realMap);
                 return;
             }
         }
@@ -10207,6 +9514,7 @@ namespace
                     << " | source=UiMapResource 01bcbd07-bdbf-41c0-9999-5d58fb1a3aa1";
                 Log(oss.str());
                 TryApplyShroudSdf(directories, g_realMap);
+                ShrinkRealMapToConfiguredSize(g_realMap);
                 return;
             }
         }
@@ -11007,6 +10315,18 @@ namespace
         return fallback;
     }
 
+    // Height of the padded silhouette relative to the icon it outlines.
+    float IconSilhouetteDrawScale(std::uint32_t iconKey)
+    {
+        std::lock_guard<std::mutex> lock(g_minimapIconMutex);
+        for (const MinimapIcon& icon : g_minimapIcons.icons)
+        {
+            if (icon.key == iconKey && icon.height != 0)
+                return static_cast<float>(icon.height + IconSilhouettePadding(icon.width, icon.height) * 2) / static_cast<float>(icon.height);
+        }
+        return 1.0f;
+    }
+
     std::uint32_t FindIconSilhouetteKey(std::uint32_t iconKey)
     {
         EnsureMinimapIconsLoaded();
@@ -11360,6 +10680,8 @@ namespace
 
     void __fastcall CaptureMapMarkerVisibilityRecordHook(MapMarkerVisibilityIterationRecord* recordPtr, void*)
     {
+        if (!g_minimapEnabled.load())
+            return;
         if (g_visibleMapMarkerCaptureDisabled.load(std::memory_order_relaxed) || recordPtr == nullptr)
             return;
 
@@ -11448,6 +10770,9 @@ namespace
     constexpr std::size_t SESSION_PLAYER_WAYPOINT_OFFSET = 0x30;
     constexpr std::size_t SESSION_PLAYER_WAYPOINT_FLAG_OFFSET = 0x48;
     constexpr std::uint32_t MAP_MARKER_KEY_PLAYER_PING = 0x83405288u;   // mapmarker_playerPing
+    // Extra textures added to embervale_minimap_icons.bin with tools/map-render/add_icon.py:
+    constexpr std::uint32_t MAP_MARKER_KEY_WAYPOINT = 0xFFFF0010u;      // mapmarker_waypoint (64x64)
+    constexpr std::uint32_t MAP_MARKER_KEY_NPC_FIGURE = 0xFFFF0011u;    // compass_player figure, drawn sky blue for NPCs
     // player_waypoints_ui also appends UiPingEvent / UiPingInputEvent records (0x28 bytes)
     // to FbUiPlayData+0x3698 (ptr) / +0x36A0 (count).
     constexpr std::size_t UI_PING_EVENT_ARRAY = 0x3698;
@@ -12052,13 +11377,18 @@ namespace
                 else if (marker.moving)
                     kind = 13;      // remote player: a moving marker without a map icon
                 else if (IsIconlessMapMarkerKey(marker.key))
-                    continue;       // static iconless markers: the world map does not draw these
+                    kind = 12;      // registry types without an icon: NPC-style markers (portrait drawn by the game)
                 else if (marker.key == MASTER_KEY_FLAME_ALTAR)
                     kind = 31;
                 else
                     kind = 55;
 
-                PushWorldPointUnique(points, { FixedToWorld(marker.x), FixedToWorld(marker.z), kind });
+                // NPCs stand a couple of metres apart at a base; the 4 m de-duplication
+                // meant for stacked POI icons swallowed most of them.
+                if (kind == 12)
+                    points.push_back({ FixedToWorld(marker.x), FixedToWorld(marker.z), kind });
+                else
+                    PushWorldPointUnique(points, { FixedToWorld(marker.x), FixedToWorld(marker.z), kind });
             }
         }
 
@@ -12112,7 +11442,7 @@ namespace
             if (silhouette != 0)
                 nearest->highlight = silhouette;
             else
-                points.push_back({ mark.x, mark.z, SPRITE_KEY_WAYPOINT_RING, 0, 0 });
+                points.push_back({ mark.x, mark.z, MAP_MARKER_KEY_WAYPOINT, 0, 0 });   // the icon carries its own outline
         }
     }
 
@@ -12323,7 +11653,7 @@ namespace
             const auto priority = [](const MinimapWorldPoint& point)
             {
                 return point.kind == 13 || point.kind == MAP_MARKER_KEY_PLAYER_PING ||
-                    point.kind == SPRITE_KEY_WAYPOINT_RING || point.highlight != 0;
+                    point.kind == MAP_MARKER_KEY_WAYPOINT || point.highlight != 0;
             };
             const bool leftPlayer = priority(left);
             const bool rightPlayer = priority(right);
@@ -12682,6 +12012,8 @@ namespace
 
         void* descriptorSet = reinterpret_cast<void*>(renderer.frameDescriptorSet);
         renderer.fns.cmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, reinterpret_cast<void*>(renderer.framePipeline));
+        renderer.boundPipeline = renderer.framePipeline;
+        renderer.boundDescriptorSet = renderer.frameDescriptorSet;
         renderer.fns.cmdBindDescriptorSets(
             commandBuffer,
             VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -12834,9 +12166,15 @@ namespace
         // Nameplates are filled mid-frame and cleared at frame start; the render thread
         // sees them at a different point than the UI hook does.
         {
+            static DWORD lastRemotePlayerTick = 0;
+            const DWORD nowTick = GetTickCount();
             const uintptr_t lockedState = g_lockedUiState.load();
-            if (lockedState != 0 && TicksSince(GetTickCount(), g_lockedUiStateTick.load()) < UI_STATE_LOCK_TIMEOUT_MS)
+            if (lockedState != 0 && TicksSince(nowTick, g_lockedUiStateTick.load()) < UI_STATE_LOCK_TIMEOUT_MS &&
+                (lastRemotePlayerTick == 0 || nowTick - lastRemotePlayerTick >= 50))
+            {
+                lastRemotePlayerTick = nowTick;
                 TryCaptureRemotePlayers(reinterpret_cast<std::uint8_t*>(lockedState));
+            }
         }
 
         const std::vector<CapturedWaypoint> waypoints = CopyWaypoints();
@@ -12870,7 +12208,9 @@ namespace
         else
         {
             const float dtSeconds = static_cast<float>(MinValue<DWORD>(headingNow - smoothedHeadingTick, 250)) / 1000.0f;
-            const float alpha = 1.0f - std::exp(-dtSeconds / 0.035f);
+            // The movement heading moves in steps (one per ~0.5 m walked), so the drawn
+            // arrow eases toward it.
+            const float alpha = 1.0f - std::exp(-dtSeconds / 0.09f);
             smoothedHeading = WrapAngleRadians(smoothedHeading + WrapAngleRadians(mapHeading - smoothedHeading) * alpha);
         }
         smoothedHeadingTick = headingNow;
@@ -12953,16 +12293,66 @@ namespace
         else
             CmdClearCompassFrameOverlay(renderer, commandBuffer, cx, cy, radius);
 
-        // Pings and other players (with their names) belong on top of every other marker.
-        std::stable_partition(points.begin(), points.end(), [](const MinimapWorldPoint& point) {
-            return point.kind != 13 && point.kind != MAP_MARKER_KEY_PLAYER_PING;
+        // Draw order: map icons, then pings, then other players (with names), and the
+        // waypoint (its icon or the outlined icon) on top of everything - including us.
+        const auto drawRank = [](const MinimapWorldPoint& point) -> int
+        {
+            if (point.kind == MAP_MARKER_KEY_WAYPOINT || point.highlight != 0)
+                return 3;
+            if (point.kind == 13)
+                return 2;
+            if (point.kind == MAP_MARKER_KEY_PLAYER_PING)
+                return 1;
+            return 0;
+        };
+        std::stable_sort(points.begin(), points.end(), [&drawRank](const MinimapWorldPoint& left, const MinimapWorldPoint& right) {
+            return drawRank(left) < drawRank(right);
         });
+        std::size_t waypointStart = points.size();
+        for (std::size_t index = 0; index < points.size(); ++index)
+        {
+            if (drawRank(points[index]) == 3)
+            {
+                waypointStart = index;
+                break;
+            }
+        }
+
+        // Our own marker goes right before the waypoint layer.
+        int arrowX = cx;
+        int arrowY = cy;
+        if (staticView)
+        {
+            bool arrowClipped = false;
+            ProjectWorldToMinimap(playerX, playerZ, centerX, centerZ, unitsPerPixel, mapHeading, cx, cy, radius, arrowX, arrowY, arrowClipped);
+        }
+        const float playerSize = ClampValue(static_cast<float>(radius) * 0.15f, 16.0f, 22.0f);
+        const bool headingShown = g_headingEnabled.load();
+        const auto drawOwnMarker = [&]()
+        {
+            if (!headingShown)
+            {
+                // View direction off (F11): a round lime dot, no rotation.
+                if (!TryDrawSpriteGpu(renderer, commandBuffer, SPRITE_KEY_PLAYER_DOT, static_cast<float>(arrowX) + 0.5f, static_cast<float>(arrowY) + 0.5f, playerSize, 0.0f, 1.0f, cx, cy, frameMapRadius))
+                    CmdClearSmallCircle(renderer, commandBuffer, cx, cy, frameMapRadius, arrowX, arrowY, static_cast<int>(playerSize * 0.42f), 0.62f, 0.95f, 0.22f, 1.0f);
+                return;
+            }
+            if (!TryDrawSpriteGpu(renderer, commandBuffer, SPRITE_KEY_PLAYER, static_cast<float>(arrowX) + 0.5f, static_cast<float>(arrowY) + 0.5f, playerSize, arrowRotation, 1.0f, cx, cy, frameMapRadius))
+                CmdClearPlayerTriangle(renderer, commandBuffer, arrowX, arrowY, playerSize, arrowRotation);
+        };
+        bool ownMarkerDrawn = false;
 
         const float iconSize = ClampValue(static_cast<float>(radius) * 0.2f, 22.0f, 30.0f);
         const int pointProjectionRadius = hasRasterFrame ? frameMapRadius : radius;
         const int pointClipRadius = hasRasterFrame ? frameMapRadius : radius - 14;
-        for (const MinimapWorldPoint& point : points)
+        for (std::size_t pointIndex = 0; pointIndex < points.size(); ++pointIndex)
         {
+            const MinimapWorldPoint& point = points[pointIndex];
+            if (pointIndex == waypointStart && !ownMarkerDrawn)
+            {
+                drawOwnMarker();
+                ownMarkerDrawn = true;
+            }
             int px = cx;
             int py = cy;
             bool clipped = false;
@@ -12972,21 +12362,24 @@ namespace
             // icons, a large FPS cost). Only player-authored/critical kinds stay pinned
             // to the edge: red waypoint flags and other players.
             const bool pinnedAtRim = point.kind == 11 || point.kind == 13 ||
-                point.kind == MAP_MARKER_KEY_PLAYER_PING || point.kind == SPRITE_KEY_WAYPOINT_RING ||
+                point.kind == MAP_MARKER_KEY_PLAYER_PING || point.kind == MAP_MARKER_KEY_WAYPOINT ||
                 point.highlight != 0;
             if (clipped && !pinnedAtRim)
                 continue;
 
-            // NPCs: yellow dot. Other players: sky-blue dot.
-            if (point.kind == 12 || point.kind == 13)
+            // NPCs: the game's figure icon in sky blue.
+            if (point.kind == 12)
             {
-                const bool npc = point.kind == 12;
-                const float dotSize = npc ? (clipped ? 7.0f : 8.0f) : (clipped ? 12.0f : 15.0f);
-                if (!TryDrawSpriteGpu(renderer, commandBuffer, npc ? SPRITE_KEY_NPC : SPRITE_KEY_ALLY, static_cast<float>(px) + 0.5f, static_cast<float>(py) + 0.5f, dotSize, 0.0f, 1.0f, cx, cy, pointClipRadius))
-                {
-                    CmdClearSmallCircle(renderer, commandBuffer, cx, cy, pointClipRadius, px, py, static_cast<int>(dotSize / 2.0f),
-                        npc ? 1.0f : 0.40f, npc ? 0.85f : 0.80f, npc ? 0.20f : 1.0f, 1.0f);
-                }
+                TryDrawSpriteGpu(renderer, commandBuffer, MAP_MARKER_KEY_NPC_FIGURE, static_cast<float>(px) + 0.5f, static_cast<float>(py) + 0.5f, iconSize * 0.8f, 0.0f, 1.0f, cx, cy, pointClipRadius, 0.45f, 0.80f, 1.00f);
+                continue;
+            }
+
+            // Other players: sky-blue dot with the name underneath.
+            if (point.kind == 13)
+            {
+                const float dotSize = clipped ? 12.0f : 15.0f;
+                if (!TryDrawSpriteGpu(renderer, commandBuffer, SPRITE_KEY_ALLY, static_cast<float>(px) + 0.5f, static_cast<float>(py) + 0.5f, dotSize, 0.0f, 1.0f, cx, cy, pointClipRadius))
+                    CmdClearSmallCircle(renderer, commandBuffer, cx, cy, pointClipRadius, px, py, static_cast<int>(dotSize / 2.0f), 0.40f, 0.80f, 1.0f, 1.0f);
 
                 // Player name under the dot.
                 if (point.label != 0)
@@ -13001,13 +12394,11 @@ namespace
             }
 
             float drawSize = clipped ? iconSize * 0.75f : iconSize;
-            if (point.kind == SPRITE_KEY_WAYPOINT_RING)
-                drawSize *= 0.62f;
             if (point.highlight != 0)
             {
                 TryDrawSpriteGpu(renderer, commandBuffer, point.highlight,
                     static_cast<float>(px) + 0.5f, static_cast<float>(py) + 0.5f,
-                    drawSize, 0.0f, 1.0f, cx, cy, pointClipRadius);
+                    drawSize * IconSilhouetteDrawScale(point.kind), 0.0f, 1.0f, cx, cy, pointClipRadius);
             }
             const bool isPing = point.kind == MAP_MARKER_KEY_PLAYER_PING;
             if (isPing)
@@ -13036,17 +12427,8 @@ namespace
             CmdClearPoiIcon(renderer, commandBuffer, cx, cy, pointClipRadius, px, py, point.kind, clipped);
         }
 
-        int arrowX = cx;
-        int arrowY = cy;
-        if (staticView)
-        {
-            bool arrowClipped = false;
-            ProjectWorldToMinimap(playerX, playerZ, centerX, centerZ, unitsPerPixel, mapHeading, cx, cy, radius, arrowX, arrowY, arrowClipped);
-        }
-
-        const float playerSize = ClampValue(static_cast<float>(radius) * 0.15f, 16.0f, 22.0f);
-        if (!TryDrawSpriteGpu(renderer, commandBuffer, SPRITE_KEY_PLAYER, static_cast<float>(arrowX) + 0.5f, static_cast<float>(arrowY) + 0.5f, playerSize, arrowRotation, 1.0f, cx, cy, frameMapRadius))
-            CmdClearPlayerTriangle(renderer, commandBuffer, arrowX, arrowY, playerSize, arrowRotation);
+        if (!ownMarkerDrawn)
+            drawOwnMarker();
 
         // Esc menu edit mode: a thin outline shows the drag area, the corner square resizes.
         if (g_layoutEditMode.load())
@@ -13076,6 +12458,7 @@ namespace
         // This image's fence was waited on before recording, so a map upload that was
         // submitted with it has completed and its staging memory can go.
         ReleaseGpuMapStagingIfUploadedLocked(g_renderer, imageIndex);
+        DestroyRetiredGpuPipelinesIfSafeLocked(g_renderer, imageIndex);
         if (g_minimapMapGpuEnabled.load())
             TryCreateGpuMapResourcesLocked(g_renderer);
         TryCreateGpuSpriteResourcesLocked(g_renderer);
@@ -13083,6 +12466,10 @@ namespace
         VkCommandBufferBeginInfo beginInfo{};
         if (g_renderer.fns.beginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS)
             return false;
+
+        // A fresh command buffer inherits no pipeline state.
+        g_renderer.boundPipeline = 0;
+        g_renderer.boundDescriptorSet = 0;
 
         RecordFrameTextureUploadIfNeeded(g_renderer, commandBuffer);
         RecordGpuMapUploadIfNeeded(g_renderer, commandBuffer, imageIndex);
@@ -13140,9 +12527,21 @@ namespace
         if (queue == nullptr || firstSwapchain == 0 || info.waitSemaphoreCount > 8)
             return false;
 
-        TryRefreshPlayerPositionFromCachedCamera();
-        if (!HasFreshPlayerPosition() && g_renderCameraFallbackEnabled.load())
-            TryCapturePlayerCameraFromRenderRoots();
+        if (!g_minimapEnabled.load())
+        {
+            // First present after the switch went off: hand the map texture, the sprite
+            // atlas and every other Vulkan object back to the driver. This runs on the
+            // same thread that submits our work, so nothing of ours can still be in
+            // flight behind it. Re-enabling rebuilds everything from scratch.
+            if (g_minimapTeardownPending.exchange(false))
+            {
+                std::lock_guard<std::mutex> lock(g_rendererMutex);
+                DestroyVulkanMinimapRendererLocked();
+                Log("[Minimap] disabled: renderer and GPU textures released");
+            }
+            return false;
+        }
+
         if (!ShouldDrawMinimapInWorld())
         {
             LogDrawGateThrottled();
@@ -13177,7 +12576,13 @@ namespace
         // skips the overlay for one frame.
         void* commandFence = reinterpret_cast<void*>(g_renderer.commandFences[imageIndex]);
         void* fenceDevice = reinterpret_cast<void*>(g_renderer.device);
-        const std::int32_t fenceWait = g_renderer.fns.waitForFences(fenceDevice, 1, &commandFence, 1, 8000000ull);
+        // This runs on the game's present thread, so every microsecond spent here is
+        // frame time. Poll first (the fence is normally long signaled); only when the
+        // GPU is genuinely behind do we wait, and then briefly - dropping the overlay
+        // for one frame costs far less than stalling the whole game.
+        std::int32_t fenceWait = g_renderer.fns.waitForFences(fenceDevice, 1, &commandFence, 1, 0ull);
+        if (fenceWait != VK_SUCCESS)
+            fenceWait = g_renderer.fns.waitForFences(fenceDevice, 1, &commandFence, 1, 1500000ull);
         if (fenceWait != VK_SUCCESS)
         {
             LogRendererThrottled("[Minimap] Vulkan minimap draw skipped: previous frame still in flight");
@@ -13190,14 +12595,20 @@ namespace
             return false;
         }
 
-        std::vector<std::uint32_t> waitStages(info.waitSemaphoreCount, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+        // Fixed-size: a per-frame heap allocation on the present thread is pure waste.
+        constexpr std::uint32_t MAX_WAIT_SEMAPHORES = 16;
+        if (info.waitSemaphoreCount > MAX_WAIT_SEMAPHORES)
+            return false;
+        std::uint32_t waitStages[MAX_WAIT_SEMAPHORES];
+        for (std::uint32_t i = 0; i < info.waitSemaphoreCount; ++i)
+            waitStages[i] = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         const void* commandBuffer = reinterpret_cast<void*>(g_renderer.commandBuffers[imageIndex]);
         const void* signalSemaphore = reinterpret_cast<void*>(g_renderer.renderCompleteSemaphores[imageIndex]);
 
         VkSubmitInfo submitInfo{};
         submitInfo.waitSemaphoreCount = info.waitSemaphoreCount;
         submitInfo.pWaitSemaphores = info.pWaitSemaphores;
-        submitInfo.pWaitDstStageMask = waitStages.empty() ? nullptr : waitStages.data();
+        submitInfo.pWaitDstStageMask = info.waitSemaphoreCount == 0 ? nullptr : waitStages;
         submitInfo.commandBufferCount = 1;
         submitInfo.pCommandBuffers = &commandBuffer;
         submitInfo.signalSemaphoreCount = 1;
@@ -13317,14 +12728,19 @@ namespace
         // shared with the game and usually already consumed. The cursor only shows a few
         // frames after the press, so the press is remembered for a moment.
         const DWORD now = GetTickCount();
-        const bool escapeDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
-        if ((escapeDown && !g_layoutEscapeWasDown) || (GetAsyncKeyState(VK_ESCAPE) & 0x0001) != 0)
-            g_layoutEscapeTick.store(now);
-        g_layoutEscapeWasDown = escapeDown;
-
         CURSORINFO cursorInfo{};
         cursorInfo.cbSize = sizeof(cursorInfo);
         const bool cursorShowing = GetCursorInfo(&cursorInfo) && (cursorInfo.flags & CURSOR_SHOWING) != 0;
+
+        // Only an Esc pressed while the cursor is hidden opens the menu; an Esc pressed
+        // with the cursor showing closes something, and must not arm edit mode for the
+        // next screen (e.g. the inventory opened right after).
+        const bool escapeDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+        const bool escapePressed = (escapeDown && !g_layoutEscapeWasDown) || (GetAsyncKeyState(VK_ESCAPE) & 0x0001) != 0;
+        if (escapePressed)
+            g_layoutEscapeTick.store(cursorShowing ? 0 : now);
+        g_layoutEscapeWasDown = escapeDown;
+
         if (!cursorShowing)
         {
             if (g_layoutEditMode.exchange(false))
@@ -13342,6 +12758,7 @@ namespace
         const DWORD escapeTick = g_layoutEscapeTick.load();
         if (!g_layoutEditMode.load() && escapeTick != 0 && TicksSince(now, escapeTick) < 1500)
         {
+            g_layoutEscapeTick.store(0);
             g_layoutEditMode.store(true);
             Log("[Minimap] layout edit mode on (drag the minimap to move it, the corner square to resize)");
         }
@@ -13443,17 +12860,52 @@ namespace
         if (!configuredPressed && !legacyPressed)
             return;
 
-        const bool visible = !g_minimapVisible.load();
-        g_minimapVisible.store(visible);
+        const bool enabled = !g_minimapEnabled.load();
+        g_minimapEnabled.store(enabled);
+        g_minimapVisible.store(enabled);
+        if (!enabled)
+        {
+            // Picked up by the next present, which is where Vulkan teardown is safe.
+            g_minimapTeardownPending.store(true);
+        }
+        else
+        {
+            g_minimapTeardownPending.store(false);
+            // Come back with a clean slate: the map image was dropped from RAM after its
+            // upload, so let it reload, and rebuild the name-label atlas.
+            g_spriteAtlasRebuild.store(true);
+        }
 
         std::ostringstream oss;
-        oss << "[Minimap] visibility=" << (visible ? "on" : "off")
+        oss << "[Minimap] " << (enabled ? "enabled" : "disabled (hooks idle, GPU resources freed)")
             << " | key=" << (configuredPressed ? MinimapToggleKeyName(toggleKey) : "Numpad *");
+        Log(oss.str());
+    }
+
+    void UpdateHeadingToggleHotkey()
+    {
+        const int key = g_headingToggleKey.load();
+        if (key == 0 || (GetAsyncKeyState(key) & 0x0001) == 0)
+            return;
+
+        const bool enabled = !g_headingEnabled.load();
+        g_headingEnabled.store(enabled);
+        // Start clean either way: no stale direction from before the switch.
+        ResetHeadingState();
+
+        std::ostringstream oss;
+        oss << "[Minimap] view direction " << (enabled ? "on" : "off (own marker: dot)")
+            << " | key=" << MinimapToggleKeyName(key);
         Log(oss.str());
     }
 
     void UpdateMinimapRuntimeControls(ModContext* modContext)
     {
+        // The toggle key is the one thing that still runs while the mod is off.
+        UpdateMinimapVisibilityHotkey();
+        if (!g_minimapEnabled.load())
+            return;
+
         const DWORD now = GetTickCount();
         if (now - g_lastConfigPollTick >= MINIMAP_CONFIG_POLL_MS)
         {
@@ -13461,7 +12913,7 @@ namespace
             RefreshMinimapConfig(modContext);
         }
 
-        UpdateMinimapVisibilityHotkey();
+        UpdateHeadingToggleHotkey();
         UpdateMinimapZoomHotkeys();
         UpdateMinimapLayoutEdit();
     }
@@ -13606,8 +13058,11 @@ namespace
     std::int32_t __fastcall HookQueuePresent(void* queue, const void* presentInfo)
     {
         UpdateMinimapRuntimeControls(g_modContext);
-        TryScanVulkanDeviceFunctions();
-        LogVulkanPresentInfo(queue, presentInfo);
+        if (g_minimapEnabled.load())
+        {
+            TryScanVulkanDeviceFunctions();
+            LogVulkanPresentInfo(queue, presentInfo);
+        }
 
         const uintptr_t original = g_originalQueuePresent.load();
         auto* originalFn = reinterpret_cast<QueuePresentFn>(original);
@@ -14154,9 +13609,6 @@ namespace
             g_worldSessionReady.store(false);
             g_gameSessionOnline.store(false);
             g_lastWorldDataTick.store(0);
-            g_playerCameraAddress.store(0);
-            g_lastPlayerCameraScanTick = 0;
-            g_lastRenderCameraScanTick = 0;
             g_gameLogPath.clear();
             g_shroudtopiaConfigPath.clear();
             g_lastConfigPollTick = 0;
@@ -14227,9 +13679,6 @@ namespace
             g_worldSessionReady.store(false);
             g_gameSessionOnline.store(false);
             g_lastWorldDataTick.store(0);
-            g_playerCameraAddress.store(0);
-            g_lastPlayerCameraScanTick = 0;
-            g_lastRenderCameraScanTick = 0;
             g_lastConfigPollTick = 0;
             {
                 std::lock_guard<std::mutex> lock(g_visibleMapMarkerMutex);
@@ -14251,7 +13700,6 @@ namespace
                 PollGameSessionLog();
                 ProbeVulkanTable();
                 MaybeStartLivePositionTracker();
-                MaybeStartCameraSignatureScan();
             }
         }
 

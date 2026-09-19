@@ -7,9 +7,8 @@ draws the minimap directly inside the Enshrouded frame.
 
 ## What It Does
 
-- Shows a circular minimap on the right side of the screen.
-- Defaults to the bottom-right corner and supports top-right, middle-right,
-  and bottom-right placement.
+- Shows a minimap in the top-right corner of the screen.
+- Press `Esc` and drag it anywhere; drag its bottom-right corner to resize.
 - Uses a premium compass-style frame asset.
 - Renders the real Embervale map at minimap scale.
 - Shows the player's position and facing direction.
@@ -23,7 +22,12 @@ draws the minimap directly inside the Enshrouded frame.
 
 - `+` zooms in.
 - `-` zooms out.
-- `F10` toggles the minimap on/off without leaving the game.
+- `F10` fully enables/disables the mod. While it is off the game-thread hooks
+  return immediately, the background trackers stop, nothing is recorded or
+  submitted in the present hook, and the Vulkan objects (map texture and sprite
+  atlas) are released. Pressing it again rebuilds everything.
+- `F11` turns the view direction on/off. Off: no heading work at all and your
+  own marker becomes a round lime dot. On: the lime triangle turns with you.
 
 The numpad `+`, `-`, and `*` keys also work.
 
@@ -70,39 +74,33 @@ Enshrouded
 If you already had an older version installed, replace the whole `minimap_mod`
 folder with the new one.
 
-## Position Config
+## Config
 
-The minimap position is controlled from Shroudtopia's config file:
+Settings live in Shroudtopia's config file:
 
 ```text
 C:\Program Files (x86)\Steam\steamapps\common\Enshrouded\shroudtopia.json
 ```
 
-Set `mods.minimap_mod.position` to one of these values:
-
-- `top-right`
-- `middle-right`
-- `bottom-right`
-
-Example:
+Example (every key is optional):
 
 ```json
 {
   "mods": {
     "minimap_mod": {
       "active": true,
-      "position": "bottom-right",
       "toggle_key": "F10",
-      "render_camera_fallback": true,
       "debug_logging": false,
-      "map_renderer": "gpu",
       "map_follow": "center",
-      "map_sample_step": 2,
       "max_icons": 64
     }
   }
 }
 ```
+
+Position and size are not config values: press `Esc`, drag the minimap where you
+want it and drag its bottom-right corner to resize. The result is saved in
+`mods\minimap_mod\minimap_layout.txt`.
 
 The mod also reads `mods.minimap_mod.toggle_key` every second while active.
 Recommended value: `F10`. Supported readable values include `F1`-`F24`,
@@ -110,16 +108,15 @@ Recommended value: `F10`. Supported readable values include `F1`-`F24`,
 `numpad-*`.
 
 The minimap is always north-up: the map, compass frame and markers never
-rotate, and the player arrow turns with the camera.
+rotate. The player arrow points along the direction you travel, computed from
+the position feed at no cost (standing still keeps the last direction; turning
+the camera alone does not move it). `F11` switches it off, and your own marker
+becomes a round lime dot.
 
 `map_follow` (default `center`): `center` keeps the player arrow in the middle
 and scrolls the map. `static` keeps the map still and moves
 the arrow across it; when the arrow gets close to the rim the view glides back
 onto the player.
-
-`render_camera_fallback` is enabled by default. It lets the minimap recover its
-player position from render data when a game update stops the normal UI position
-feed from firing before the minimap draws.
 
 The mod reads these values directly and refreshes them every second while active.
 If the minimap is not loaded yet, start or restart the game after changing it.
@@ -136,6 +133,13 @@ blurry and banded no matter how detailed the map image was.
 - `map_renderer`: `gpu` (default) or `cpu` (old rasterizer, also used
   automatically if the GPU path cannot be created). `map_sample_step` and
   `map_light` only affect the `cpu` renderer.
+- `map_texture_size`: `8192` (default), `4096`, `2048` or `1024`. The HD map
+  is box-filtered down to this size when it is loaded. `4096` cuts the map's
+  VRAM from about 358 MB to 90 MB and is hard to tell apart at normal zoom.
+  The CPU copy of the map is released as soon as the GPU upload has finished.
+- `label_font_size`: height in pixels of the player and ping name labels
+  (8-40, default 17).
+- `heading_toggle_key`: key for the view-direction toggle (default `F11`).
 
 The map image is loaded in this order:
 

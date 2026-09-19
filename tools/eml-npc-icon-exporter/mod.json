@@ -1,0 +1,12 @@
+{
+  "id": "minimap_npc_icon_exporter",
+  "version": "0.1.0",
+  "name": "Minimap NPC Icon Exporter",
+  "description": "One-shot export of the world map's NPC / animal / flame altar icons (UiMapResource) and a list of UI texture names for the Shroudtopia minimap mod.",
+  "authors": [
+    "OpenAI + xoker"
+  ],
+  "capabilities": [
+    "export"
+  ]
+}
