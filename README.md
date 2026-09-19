@@ -12,6 +12,9 @@ draws the minimap directly inside the Enshrouded frame.
 - Uses a premium compass-style frame asset.
 - Renders the real Embervale map at minimap scale.
 - Shows the player's position and facing direction.
+- Darkens the parts of the map you have not discovered yet, straight from the
+  game's own fog-of-war grid (the same data the world map uses), updated live
+  as you explore.
 - Uses real map marker icons extracted from the game's map UI.
 - Shows nearby points of interest that are visible or detected by the map.
 - Uses fog-of-war and POI data as a fallback when the game does not expose all
@@ -140,6 +143,9 @@ blurry and banded no matter how detailed the map image was.
 - `label_font_size`: height in pixels of the player and ping name labels
   (8-40, default 17).
 - `heading_toggle_key`: key for the view-direction toggle (default `F11`).
+- `fog_strength`: 0-100 (default 100), opacity of the slate grey covering
+  undiscovered map areas. 100 hides the terrain completely, like the world map.
+  `0` turns the fog overlay off.
 
 The map image is loaded in this order:
 

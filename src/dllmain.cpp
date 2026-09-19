@@ -16,6 +16,7 @@
 #include <cstring>
 #include <cwchar>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -31,6 +32,9 @@ namespace
     constexpr uintptr_t RVA_KNOWLEDGE_QUERY_MAPMARKER_VISIBILITY = 0x381350;
     constexpr uintptr_t RVA_KNOWLEDGE_QUERY_MAPMARKER_VISIBILITY_LOOP = RVA_KNOWLEDGE_QUERY_MAPMARKER_VISIBILITY + 0x37;
     constexpr uintptr_t RVA_RENDER_PRESENT_FRAME = 0xDCFAE0;
+    // ECS system "fog_of_war" (components FogOfWarDiscovery, PlayerState, RenderTransform,
+    // LocalPlayerData, FogOfWar): marks the cells around the local player as discovered.
+    constexpr uintptr_t RVA_FOG_OF_WAR = 0x2A3EC0;
     constexpr uintptr_t RVA_VULKAN_DEVICE_TABLE_INIT = 0xDDBDE0;
     constexpr uintptr_t RVA_ITER_INIT = 0x8CD000;
     constexpr uintptr_t RVA_ITER_NEXT = 0x8C84E0;
@@ -41,6 +45,7 @@ namespace
     constexpr std::size_t KNOWLEDGE_QUERY_MAPMARKER_VISIBILITY_STOLEN_SIZE = 11;
     constexpr std::size_t KNOWLEDGE_QUERY_MAPMARKER_VISIBILITY_LOOP_STOLEN_SIZE = 5;
     constexpr std::size_t RENDER_PRESENT_FRAME_STOLEN_SIZE = 16;
+    constexpr std::size_t FOG_OF_WAR_STOLEN_SIZE = 17;
     constexpr std::size_t VULKAN_DEVICE_TABLE_INIT_STOLEN_SIZE = 15;
     constexpr std::size_t UI_RENDER_SETUP_SOURCE_OFFSET = 0x10;
     constexpr std::size_t UI_RENDER_SETUP_STATE_OFFSET = 0x20;
@@ -237,6 +242,24 @@ namespace
     };
     static_assert(sizeof(WaypointsUiIterationRecord) == 0x30, "Unexpected player_waypoints_ui iteration record size");
     static_assert(offsetof(WaypointsUiIterationRecord, state) == WAYPOINT_STATE_PTR_OFFSET, "Unexpected state offset");
+
+    // fog_of_war (exe 0x1402a3ec0) iterates with a 0x30-byte record: [ctx, FogOfWarDiscovery*,
+    // PlayerState*, RenderTransform*, LocalPlayerData*, FogOfWar*]. The FogOfWar object:
+    //   +0x00 float mapSizeX, +0x04 float mapSizeZ      (world units)
+    //   +0x08 u32 widthBlocks, +0x0C u32 heightBlocks   (blocks of 32x32 cells, 8 units per cell)
+    //   +0x18 u8* blocks (widthBlocks*heightBlocks*1024, row-major inside a block)
+    //   +0x20 u64 blockCount, +0x28.. dirty bitset, +0x40 u32 dirty count
+    // A cell value is 0..255 ("how well discovered"), row 0 lies at z = mapSizeZ.
+    struct FogOfWarIterationRecord
+    {
+        void* ctx = nullptr;
+        void* discovery = nullptr;
+        void* playerState = nullptr;
+        void* renderTransform = nullptr;
+        void* localPlayerData = nullptr;
+        std::uint8_t* fogOfWar = nullptr;
+    };
+    static_assert(sizeof(FogOfWarIterationRecord) == 0x30, "Unexpected fog_of_war iteration record size");
 
     struct MapMarkerVisibilityIterationRecord
     {
@@ -1096,6 +1119,14 @@ namespace
         bool uploadPending = false;
         bool ready = false;
         bool attempted = false;
+        // Re-uploadable texture (fog of war): the staging buffer stays mapped and is
+        // refilled whenever the content changes. stagingBusy is set from the moment an
+        // upload is recorded until that command buffer's fence has been waited on.
+        bool persistentStaging = false;
+        bool stagingBusy = false;
+        bool uploadedOnce = false;
+        std::uint8_t* stagingMapped = nullptr;
+        std::uint64_t contentVersion = 0;
     };
 
     // A pipeline replaced while command buffers that reference it may still be in
@@ -1152,6 +1183,7 @@ namespace
         bool frameTextureReady = false;
         GpuTexturePipeline mapGpu;
         GpuTexturePipeline spriteGpu;
+        GpuTexturePipeline fogGpu;
         std::vector<GpuSpriteRect> spriteRects;
         std::vector<RetiredGpuPipeline> retiredPipelines;
         // Redundant-bind filter, valid only inside one command-buffer recording.
@@ -1256,6 +1288,7 @@ namespace
     Mem::Detour* g_localPlayerUiRenderSetupHook = nullptr;
     Mem::Detour* g_playerWaypointsUiHook = nullptr;
     Mem::Detour* g_mapMarkerVisibilityHook = nullptr;
+    Mem::Detour* g_fogOfWarHook = nullptr;
     Mem::Detour* g_renderPresentFrameHook = nullptr;
     Mem::Detour* g_vulkanDeviceTableInitHook = nullptr;
 
@@ -1343,6 +1376,28 @@ namespace
     constexpr int MINIMAP_MAP_TEXTURE_SIZE_DEFAULT = 8192;
     std::atomic<int> g_minimapMapTextureSize{ MINIMAP_MAP_TEXTURE_SIZE_DEFAULT };
     std::atomic<int> g_nameSpriteBuiltSize{ 0 };
+    // "fog_strength" in shroudtopia.json (0..100, default 100): opacity of the slate
+    // grey that covers the parts of the map you have not discovered yet. 100 hides the
+    // terrain completely (like the world map); 0 turns the overlay off.
+    constexpr int MINIMAP_FOG_STRENGTH_DEFAULT = 100;
+    std::atomic<int> g_minimapFogStrength{ MINIMAP_FOG_STRENGTH_DEFAULT };
+
+    // Live copy of the game's fog-of-war grid (see FogOfWarIterationRecord).
+    struct FogOfWarGrid
+    {
+        bool valid = false;
+        float sizeX = 0.0f;
+        float sizeZ = 0.0f;
+        std::uint32_t width = 0;     // cells
+        std::uint32_t height = 0;
+        std::vector<std::uint8_t> cells;   // row-major, row 0 at z = sizeZ
+        std::uint64_t version = 0;
+        DWORD lastCaptureTick = 0;
+        uintptr_t address = 0;
+    };
+    std::mutex g_fogGridMutex;
+    FogOfWarGrid g_fogGrid;
+    std::atomic<bool> g_fogGridLogged{ false };
     std::atomic<bool> g_minimapVisible{ true };
     // The F10 master switch. Off means the mod does nothing at all: the game-thread
     // hooks return immediately, the background trackers stop, no command buffer is
@@ -1351,9 +1406,23 @@ namespace
     std::atomic<bool> g_minimapEnabled{ true };
     std::atomic<bool> g_minimapTeardownPending{ false };
 
+    // Set by Unload: every background loop leaves, and no new one starts.
+    std::atomic<bool> g_shuttingDown{ false };
+    std::atomic<int> g_backgroundThreads{ 0 };
+
+    // Counts a detached worker for the duration of its body so Unload can wait for it
+    // instead of letting the DLL disappear underneath a running thread.
+    struct BackgroundThreadScope
+    {
+        BackgroundThreadScope() { g_backgroundThreads.fetch_add(1); }
+        ~BackgroundThreadScope() { g_backgroundThreads.fetch_sub(1); }
+        BackgroundThreadScope(const BackgroundThreadScope&) = delete;
+        BackgroundThreadScope& operator=(const BackgroundThreadScope&) = delete;
+    };
+
     bool MinimapRuntimeActive()
     {
-        return g_worldSessionReady.load() && g_minimapEnabled.load();
+        return !g_shuttingDown.load() && g_worldSessionReady.load() && g_minimapEnabled.load();
     }
 
     // F11 (config "heading_toggle_key"): the view-direction feature. Off means no
@@ -1408,6 +1477,13 @@ namespace
 
     std::array<std::uint8_t, KNOWLEDGE_QUERY_MAPMARKER_VISIBILITY_LOOP_STOLEN_SIZE> g_mapMarkerVisibilityLoopExpected = {
         0x48, 0x89, 0x74, 0x24, 0x68
+    };
+
+    std::array<std::uint8_t, FOG_OF_WAR_STOLEN_SIZE> g_fogOfWarExpected = {
+        0x40, 0x57,                                 // push rdi
+        0x48, 0x83, 0xEC, 0x60,                     // sub rsp, 60h
+        0x41, 0xB8, 0x30, 0x00, 0x00, 0x00,         // mov r8d, 30h (iteration record size)
+        0x48, 0x8D, 0x54, 0x24, 0x20                // lea rdx, [rsp+20h]
     };
 
     std::array<std::uint8_t, RENDER_PRESENT_FRAME_STOLEN_SIZE> g_renderPresentFrameExpected = {
@@ -1702,6 +1778,16 @@ namespace
             g_minimapLabelFontSize.store(ClampValue(labelSize, 8, 40));
         }
 
+        std::string configuredFogStrength = std::to_string(MINIMAP_FOG_STRENGTH_DEFAULT);
+        std::string fogStrengthSource = "default";
+        if (!TryReadMinimapConfigStringFromFile(modContext, "fog_strength", configuredFogStrength, fogStrengthSource) &&
+            modContext != nullptr && modContext->config.GetString)
+        {
+            configuredFogStrength = modContext->config.GetString("minimap_mod", "fog_strength", configuredFogStrength);
+            fogStrengthSource = "shroudtopia_config_api";
+        }
+        g_minimapFogStrength.store(ParseConfigInteger(configuredFogStrength, MINIMAP_FOG_STRENGTH_DEFAULT, 0, 100));
+
         std::string configuredMapTextureSize = std::to_string(MINIMAP_MAP_TEXTURE_SIZE_DEFAULT);
         std::string mapTextureSizeSource = "default";
         if (!TryReadMinimapConfigStringFromFile(modContext, "map_texture_size", configuredMapTextureSize, mapTextureSizeSource) &&
@@ -1781,6 +1867,7 @@ namespace
             << " | label_font_size=" << g_minimapLabelFontSize.load()
             << " | label_font_size_source=" << labelSizeSource
             << " | map_texture_size=" << g_minimapMapTextureSize.load()
+            << " | fog_strength=" << g_minimapFogStrength.load()
             << " | map_follow=" << (staticView ? "static" : "center")
             << " | map_follow_source=" << mapFollowSource;
         Log(oss.str());
@@ -2503,6 +2590,14 @@ namespace
         const bool wasOnline = g_gameSessionOnline.exchange(false);
         const bool wasReady = g_worldSessionReady.exchange(false);
         g_lastWorldDataTick.store(0);
+        {
+            // The next world brings its own grid; do not draw this one over it.
+            std::lock_guard<std::mutex> lock(g_fogGridMutex);
+            g_fogGrid.valid = false;
+            std::vector<std::uint8_t>().swap(g_fogGrid.cells);
+            ++g_fogGrid.version;
+        }
+        g_fogGridLogged.store(false);
 
         {
             std::lock_guard<std::mutex> lock(g_playerPositionMutex);
@@ -3949,6 +4044,7 @@ namespace
         g_liveTrackerLastStartTick.store(now);
         std::thread([]()
         {
+            BackgroundThreadScope scope;
             RunLivePositionTracker();
             g_liveTrackerRunning.store(false);
         }).detach();
@@ -4516,11 +4612,18 @@ namespace
         Log(oss.str());
     }
 
+    // iter_init/iter_next size the record from the query itself, not from the size we
+    // pass: a query with more components than our struct has slots would run past it.
+    // Every record therefore lives in this oversized, zeroed scratch area.
+    constexpr std::size_t ITER_RECORD_SCRATCH_BYTES = 0x200;
+
     bool TryInitWaypointRecord(void* ctx, WaypointsUiIterationRecord& record)
     {
         __try
         {
-            g_iterInit(ctx, &record, static_cast<std::uint32_t>(sizeof(record)));
+            alignas(16) std::uint8_t scratch[ITER_RECORD_SCRATCH_BYTES] = {};
+            g_iterInit(ctx, scratch, static_cast<std::uint32_t>(sizeof(record)));
+            std::memcpy(&record, scratch, sizeof(record));
             return true;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
@@ -4541,13 +4644,16 @@ namespace
             // hosting). Put the cursor back exactly where the game expects it.
             auto* cursor = reinterpret_cast<std::uint32_t*>(static_cast<std::uint8_t*>(ctx) + 0x08);
             const std::uint32_t savedCursor = *cursor;
-            g_iterInit(ctx, &record, static_cast<std::uint32_t>(sizeof(record)));
+            alignas(16) std::uint8_t scratch[ITER_RECORD_SCRATCH_BYTES] = {};
+            auto* scratchRecord = reinterpret_cast<UiRenderSetupIterationRecord*>(scratch);
+            g_iterInit(ctx, scratch, static_cast<std::uint32_t>(sizeof(record)));
             // May-24-2026 client: iter_init only prepares the cursor; fields are filled by
             // the first iter_next (matches the game's own call sequence at this hook).
             bool ok = true;
-            if ((record.source == nullptr || record.state == nullptr) && g_iterNext != nullptr)
-                ok = g_iterNext(ctx, &record, static_cast<std::uint32_t>(sizeof(record)));
+            if ((scratchRecord->source == nullptr || scratchRecord->state == nullptr) && g_iterNext != nullptr)
+                ok = g_iterNext(ctx, scratch, static_cast<std::uint32_t>(sizeof(record)));
             *cursor = savedCursor;
+            std::memcpy(&record, scratch, sizeof(record));
             return ok;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
@@ -5956,6 +6062,7 @@ namespace
         g_pingHuntLastTick.store(now);
         std::thread([]()
         {
+            BackgroundThreadScope scope;
             RunPingHunt();
             g_pingHuntBusy.store(false);
         }).detach();
@@ -5965,6 +6072,11 @@ namespace
     // The memory hunts found the player list and the ping queue (9/18); they stay in the
     // source for future game updates but are off, since each scan costs seconds of CPU.
     constexpr bool MEMORY_HUNTS_ENABLED = false;
+    // The per-marker hook inside knowledge_query_mapmarker_visibility ran once per
+    // marker per frame on the game thread (SEH copy, a memory read and a mutex each)
+    // and, on the September 2026 client, produced a single bogus entry: the master
+    // marker arrays carry everything the world map shows. Off by default.
+    constexpr bool MARKER_VISIBILITY_HOOK_ENABLED = false;
 
     void RunRemotePlayerProbe(std::uint8_t* state)
     {
@@ -5990,6 +6102,7 @@ namespace
             const int runIndex = ++g_huntRuns;
             std::thread([runIndex]()
             {
+                BackgroundThreadScope scope;
                 RunRemotePlayerHunt(runIndex);
                 g_huntBusy.store(false);
             }).detach();
@@ -6175,6 +6288,153 @@ namespace
 
         PublishWaypoints(std::move(waypoints));
         return true;
+    }
+
+    // ---- fog of war capture (game thread, fog_of_war system entry) ----
+    struct FogOfWarHeader
+    {
+        float sizeX = 0.0f;
+        float sizeZ = 0.0f;
+        std::uint32_t widthBlocks = 0;
+        std::uint32_t heightBlocks = 0;
+        std::uint64_t allocator = 0;
+        std::uint64_t blocks = 0;
+        std::uint64_t blockCount = 0;
+    };
+    static_assert(sizeof(FogOfWarHeader) == 0x28, "Unexpected FogOfWarHeader size");
+
+    bool FogOfWarHeaderPlausible(const FogOfWarHeader& header)
+    {
+        return std::isfinite(header.sizeX) && std::isfinite(header.sizeZ) &&
+            header.sizeX >= 512.0f && header.sizeX <= 65536.0f &&
+            header.sizeZ >= 512.0f && header.sizeZ <= 65536.0f &&
+            header.widthBlocks >= 1 && header.widthBlocks <= 256 &&
+            header.heightBlocks >= 1 && header.heightBlocks <= 256 &&
+            header.blockCount == static_cast<std::uint64_t>(header.widthBlocks) * header.heightBlocks &&
+            IsLikelyRuntimePointer(static_cast<uintptr_t>(header.blocks));
+    }
+
+    // Walks the system's query (restoring its cursor afterwards, see
+    // TryInitUiRenderSetupRecord) and returns the first plausible FogOfWar object.
+    // No C++ objects with destructors inside: SEH frame.
+    std::uint8_t* FindFogOfWarObjectGuarded(void* ctx, FogOfWarHeader* outHeader)
+    {
+        __try
+        {
+            auto* cursor = reinterpret_cast<std::uint32_t*>(static_cast<std::uint8_t*>(ctx) + 0x08);
+            const std::uint32_t savedCursor = *cursor;
+            std::uint8_t* found = nullptr;
+            alignas(16) std::uint8_t scratch[ITER_RECORD_SCRATCH_BYTES] = {};
+            auto* record = reinterpret_cast<FogOfWarIterationRecord*>(scratch);
+            g_iterInit(ctx, scratch, static_cast<std::uint32_t>(sizeof(FogOfWarIterationRecord)));
+            for (int guard = 0; guard < 8 && found == nullptr; ++guard)
+            {
+                if (!g_iterNext(ctx, scratch, static_cast<std::uint32_t>(sizeof(FogOfWarIterationRecord))))
+                    break;
+                if (record->fogOfWar == nullptr || !IsLikelyRuntimePointer(reinterpret_cast<uintptr_t>(record->fogOfWar)))
+                    continue;
+                FogOfWarHeader header{};
+                if (SafeRead(reinterpret_cast<uintptr_t>(record->fogOfWar), &header, sizeof(header)) && FogOfWarHeaderPlausible(header))
+                {
+                    *outHeader = header;
+                    found = record->fogOfWar;
+                }
+            }
+            *cursor = savedCursor;
+            return found;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return nullptr;
+        }
+    }
+
+    std::mutex g_fogCaptureMutex;
+
+    void TryCaptureFogOfWar(void* ctx)
+    {
+        // The ECS may run this system on any worker thread; never two captures at once.
+        std::unique_lock<std::mutex> captureLock(g_fogCaptureMutex, std::try_to_lock);
+        if (!captureLock.owns_lock())
+            return;
+
+        FogOfWarHeader header{};
+        std::uint8_t* object = FindFogOfWarObjectGuarded(ctx, &header);
+        if (object == nullptr)
+            return;
+
+        const std::size_t blockBytes = static_cast<std::size_t>(header.blockCount) * 1024;
+        static std::vector<std::uint8_t> raw;      // guarded by g_fogCaptureMutex
+        static std::vector<std::uint8_t> cells;
+        raw.resize(blockBytes);
+        if (!SafeRead(static_cast<uintptr_t>(header.blocks), raw.data(), blockBytes))
+            return;
+
+        // De-block: cell (x, y) lives in block (x >> 5, y >> 5) at (y & 31) * 32 + (x & 31).
+        const std::uint32_t width = header.widthBlocks * 32;
+        const std::uint32_t height = header.heightBlocks * 32;
+        cells.resize(static_cast<std::size_t>(width) * height);
+        for (std::uint32_t by = 0; by < header.heightBlocks; ++by)
+        {
+            for (std::uint32_t bx = 0; bx < header.widthBlocks; ++bx)
+            {
+                const std::uint8_t* block = raw.data() + (static_cast<std::size_t>(by) * header.widthBlocks + bx) * 1024;
+                for (std::uint32_t row = 0; row < 32; ++row)
+                {
+                    std::memcpy(
+                        cells.data() + (static_cast<std::size_t>(by) * 32 + row) * width + static_cast<std::size_t>(bx) * 32,
+                        block + row * 32,
+                        32);
+                }
+            }
+        }
+
+        std::size_t discovered = 0;
+        bool changed = false;
+        {
+            std::lock_guard<std::mutex> lock(g_fogGridMutex);
+            FogOfWarGrid& grid = g_fogGrid;
+            changed = !grid.valid || grid.width != width || grid.height != height || grid.cells != cells;
+            if (changed)
+            {
+                grid.cells = cells;
+                grid.width = width;
+                grid.height = height;
+                grid.sizeX = header.sizeX;
+                grid.sizeZ = header.sizeZ;
+                grid.valid = true;
+                ++grid.version;
+            }
+            grid.address = reinterpret_cast<uintptr_t>(object);
+            grid.lastCaptureTick = GetTickCount();
+        }
+
+        if (!g_fogGridLogged.exchange(true) || (changed && g_debugLoggingEnabled.load()))
+        {
+            for (std::uint8_t value : cells)
+                discovered += value >= 64 ? 1 : 0;
+            std::ostringstream oss;
+            oss << "[Minimap] fog of war grid"
+                << " | object=" << Hex(reinterpret_cast<uintptr_t>(object))
+                << " | world=" << header.sizeX << "x" << header.sizeZ
+                << " | blocks=" << header.widthBlocks << "x" << header.heightBlocks
+                << " | cells=" << width << "x" << height
+                << " | discovered=" << (discovered * 100 / MaxValue<std::size_t>(1, cells.size())) << "%";
+            Log(oss.str());
+        }
+    }
+
+    void __fastcall CaptureFogOfWarHook(void* ctx, void*, void*, void*)
+    {
+        if (!g_minimapEnabled.load() || g_iterInit == nullptr || g_iterNext == nullptr || ctx == nullptr)
+            return;
+        // The grid only grows as you walk; 2 Hz keeps the copy (1.6 MB) negligible.
+        static DWORD lastCaptureTick = 0;
+        const DWORD now = GetTickCount();
+        if (lastCaptureTick != 0 && now - lastCaptureTick < 500)
+            return;
+        lastCaptureTick = now;
+        TryCaptureFogOfWar(ctx);
     }
 
     void __fastcall CaptureUiRenderSetupHook(void* ctx, void*, void*, void*)
@@ -7162,6 +7422,9 @@ namespace
         void* device = reinterpret_cast<void*>(renderer.device);
         if (device != nullptr)
         {
+            if (gp.stagingMapped != nullptr && gp.stagingMemory != 0 && renderer.fns.unmapMemory != nullptr)
+                renderer.fns.unmapMemory(device, reinterpret_cast<void*>(gp.stagingMemory));
+            gp.stagingMapped = nullptr;
             if (gp.stagingBuffer != 0 && renderer.fns.destroyBuffer != nullptr)
                 renderer.fns.destroyBuffer(device, reinterpret_cast<void*>(gp.stagingBuffer), nullptr);
             if (gp.stagingMemory != 0 && renderer.fns.freeMemory != nullptr)
@@ -7210,6 +7473,27 @@ namespace
     // textured-quad pipeline around the given fragment shader. The pixels are copied
     // into the staging buffer here; the GPU upload is recorded later by
     // RecordGpuTextureUploadIfNeeded (outside the render pass).
+    // Writes the base image plus its generated mips into a mapped staging buffer laid
+    // out as `regions` describes.
+    void WriteMipChainToStaging(const std::vector<VkBufferImageCopy>& regions, std::uint8_t* out, const std::uint8_t* rgba, std::uint32_t size)
+    {
+        std::memcpy(out, rgba, static_cast<std::size_t>(size) * size * 4);
+
+        std::vector<std::uint8_t> previous;
+        const std::uint8_t* source = rgba;
+        std::uint32_t sourceSize = size;
+        for (std::size_t level = 1; level < regions.size(); ++level)
+        {
+            const std::uint32_t dim = regions[level].imageExtent.width;
+            std::vector<std::uint8_t> current(static_cast<std::size_t>(dim) * dim * 4);
+            DownsampleRgbaLevel(source, sourceSize, current.data(), dim);
+            std::memcpy(out + regions[level].bufferOffset, current.data(), current.size());
+            previous.swap(current);
+            source = previous.data();
+            sourceSize = dim;
+        }
+    }
+
     bool TryCreateGpuTexturePipelineLocked(
         VulkanMinimapRenderer& renderer,
         GpuTexturePipeline& gp,
@@ -7217,7 +7501,9 @@ namespace
         const std::uint8_t* rgba,
         std::uint32_t size,
         std::uint32_t maxLevels,
-        const char* label)
+        const char* label,
+        bool persistentStaging = false,
+        const std::vector<std::vector<std::uint8_t>>* prebuiltMips = nullptr)
     {
         const auto fail = [&renderer, &gp, label](const char* step) -> bool
         {
@@ -7235,7 +7521,13 @@ namespace
             return false;
         }
 
-        const std::uint32_t levels = MaxValue<std::uint32_t>(1, MinValue(ComputeMipLevelCount(size), maxLevels));
+        std::uint32_t levels = MaxValue<std::uint32_t>(1, MinValue(ComputeMipLevelCount(size), maxLevels));
+        if (prebuiltMips != nullptr)
+        {
+            if (prebuiltMips->empty())
+                return false;
+            levels = MinValue<std::uint32_t>(levels, static_cast<std::uint32_t>(prebuiltMips->size()));
+        }
         std::vector<VkBufferImageCopy> regions(levels);
         std::uint64_t totalBytes = 0;
         for (std::uint32_t level = 0; level < levels; ++level)
@@ -7253,7 +7545,6 @@ namespace
         }
 
         void* device = reinterpret_cast<void*>(renderer.device);
-        const std::size_t baseBytes = static_cast<std::size_t>(size) * size * 4;
 
         // Staging buffer holding the whole mip chain.
         VkBufferCreateInfo bufferInfo{};
@@ -7272,25 +7563,33 @@ namespace
             return fail("staging memory");
         gp.stagingMemory = reinterpret_cast<uintptr_t>(stagingMemory);
 
+        if (prebuiltMips != nullptr)
         {
+            // The chain was generated off the render thread; this is just the copy.
             auto* out = static_cast<std::uint8_t*>(mapped);
-            std::memcpy(out, rgba, baseBytes);
-
-            std::vector<std::uint8_t> previous;
-            const std::uint8_t* source = rgba;
-            std::uint32_t sourceSize = size;
-            for (std::uint32_t level = 1; level < levels; ++level)
+            for (std::uint32_t level = 0; level < levels; ++level)
             {
                 const std::uint32_t dim = regions[level].imageExtent.width;
-                std::vector<std::uint8_t> current(static_cast<std::size_t>(dim) * dim * 4);
-                DownsampleRgbaLevel(source, sourceSize, current.data(), dim);
-                std::memcpy(out + regions[level].bufferOffset, current.data(), current.size());
-                previous.swap(current);
-                source = previous.data();
-                sourceSize = dim;
+                const std::size_t bytes = static_cast<std::size_t>(dim) * dim * 4;
+                const std::vector<std::uint8_t>& mip = (*prebuiltMips)[level];
+                if (mip.size() < bytes)
+                    return fail("prebuilt mip size");
+                std::memcpy(out + regions[level].bufferOffset, mip.data(), bytes);
             }
         }
-        renderer.fns.unmapMemory(device, stagingMemory);
+        else
+        {
+            WriteMipChainToStaging(regions, static_cast<std::uint8_t*>(mapped), rgba, size);
+        }
+        if (persistentStaging)
+        {
+            gp.persistentStaging = true;
+            gp.stagingMapped = static_cast<std::uint8_t*>(mapped);
+        }
+        else
+        {
+            renderer.fns.unmapMemory(device, stagingMemory);
+        }
         if (renderer.fns.bindBufferMemory(device, stagingBuffer, stagingMemory, 0) != VK_SUCCESS)
             return fail("bind staging memory");
 
@@ -7460,6 +7759,7 @@ namespace
         gp.mipLevels = levels;
         gp.uploadPending = true;
         gp.stagingReleasePending = false;
+        gp.stagingBusy = persistentStaging;
         gp.ready = true;
         gp.uploadBytes = totalBytes;
         return true;
@@ -7778,7 +8078,7 @@ namespace
 
     std::mutex g_nameSpriteMutex;
     std::vector<NameSprite> g_nameSprites;
-    std::atomic<bool> g_spriteAtlasRebuild{ false };
+    void RequestSpriteAtlasRebuild();
 
     std::uint32_t EnsureNameSprite(const std::string& text)
     {
@@ -7796,7 +8096,7 @@ namespace
         sprite.key = SPRITE_KEY_NAME_BASE + static_cast<std::uint32_t>(g_nameSprites.size());
         sprite.text = text;
         g_nameSprites.push_back(sprite);
-        g_spriteAtlasRebuild.store(true);
+        RequestSpriteAtlasRebuild();
         return sprite.key;
     }
 
@@ -7922,41 +8222,39 @@ namespace
     }
     // ---- END PLAYER NAME LABELS ----
 
-    bool TryCreateGpuSpriteResourcesLocked(VulkanMinimapRenderer& renderer)
+    // A finished atlas, built on a worker thread: the packed image with its mip chain
+    // and the sprite rectangles. The render thread only copies it into a staging
+    // buffer and creates the pipeline (~10 ms for 4096 x 4096 instead of ~100 ms of
+    // GDI text rendering, packing and mip generation on the frame).
+    struct SpriteAtlasBuild
     {
-        GpuTexturePipeline& gp = renderer.spriteGpu;
-        if (g_nameSpriteBuiltSize.load() != 0 && g_nameSpriteBuiltSize.load() != NameSpriteFontHeight())
-            g_spriteAtlasRebuild.store(true);
-        if (g_spriteAtlasRebuild.exchange(false) && (gp.ready || gp.attempted))
-        {
-            // A new player name needs a new atlas. The old one may still be referenced by
-            // submitted command buffers, so it is parked and destroyed a few frames later
-            // instead of stalling the device (vkDeviceWaitIdle races the game's own
-            // submitting threads and can lose the device).
-            if (gp.ready)
-            {
-                RetiredGpuPipeline retired{};
-                retired.gp = gp;
-                renderer.retiredPipelines.push_back(std::move(retired));
-                gp = GpuTexturePipeline{};
-            }
-            else
-            {
-                DestroyGpuTexturePipelineLocked(renderer, gp);
-            }
-            renderer.spriteRects.clear();
-            gp.attempted = false;
-            gp.ready = false;
-        }
-        if (gp.ready)
-            return true;
-        if (gp.attempted)
-            return false;
-        gp.attempted = true;
+        bool ok = false;
+        std::uint32_t atlasSize = 0;
+        std::uint32_t cell = 0;
+        std::uint32_t levels = 1;
+        std::vector<std::vector<std::uint8_t>> mips;
+        std::vector<GpuSpriteRect> rects;
+        int fontHeight = 0;
+        std::uint64_t request = 0;
+    };
+    std::mutex g_spriteAtlasMutex;
+    std::unique_ptr<SpriteAtlasBuild> g_pendingSpriteAtlas;     // guarded by g_spriteAtlasMutex
+    std::atomic<bool> g_spriteAtlasWorkerBusy{ false };
+    std::atomic<std::uint64_t> g_spriteAtlasRequest{ 1 };      // bumped whenever the atlas must change
+    std::atomic<std::uint64_t> g_spriteAtlasStarted{ 0 };      // request the last worker was started for
+    std::atomic<DWORD> g_spriteAtlasRequestTick{ 0 };
+    std::atomic<int> g_spriteAtlasFailures{ 0 };
 
-        if (!CanStartGpuPipelineLocked(renderer))
-            return false;
+    void RequestSpriteAtlasRebuild()
+    {
+        g_spriteAtlasRequest.fetch_add(1);
+        g_spriteAtlasRequestTick.store(GetTickCount());
+    }
 
+    // Everything CPU-side: renders the name labels, gathers the icons and their
+    // silhouettes, packs the atlas and generates its mips. Safe on any thread.
+    void BuildSpriteAtlasCpu(SpriteAtlasBuild& build)
+    {
         std::vector<SpriteImage> images;
         images.push_back(BuildPlayerSprite());
         // Same lime fill and dark rim as the triangle.
@@ -7964,7 +8262,7 @@ namespace
         images.push_back(BuildDotSprite(SPRITE_KEY_ALLY, 0.40f, 0.80f, 1.00f, 0.03f, 0.10f, 0.16f));
         images.push_back(BuildDotSprite(SPRITE_KEY_NPC, 1.00f, 0.85f, 0.20f, 0.20f, 0.14f, 0.02f));
         images.push_back(BuildWaypointRingSprite());
-        g_nameSpriteBuiltSize.store(NameSpriteFontHeight());
+        build.fontHeight = NameSpriteFontHeight();
         for (const NameSprite& sprite : CopyNameSprites())
         {
             SpriteImage text{};
@@ -8002,7 +8300,7 @@ namespace
         if (columns * cell > atlasSize)
         {
             Log("[Minimap] GPU sprites unavailable (icon atlas too large)");
-            return false;
+            return;
         }
 
         std::vector<std::uint8_t> atlas(static_cast<std::size_t>(atlasSize) * atlasSize * 4, 0);
@@ -8048,20 +8346,131 @@ namespace
         std::uint32_t levels = 1;
         while (levels < SPRITE_ATLAS_MAX_LEVELS && (SPRITE_ATLAS_PADDING >> (levels - 1)) >= 2)
             ++levels;
+        levels = MinValue(levels, ComputeMipLevelCount(atlasSize));
 
-        if (!TryCreateGpuTexturePipelineLocked(renderer, gp, MINIMAP_SPRITE_FRAGMENT_SHADER, atlas.data(), atlasSize, levels, "sprites"))
+        build.mips.clear();
+        build.mips.push_back(std::move(atlas));
+        std::uint32_t dim = atlasSize;
+        for (std::uint32_t level = 1; level < levels; ++level)
+        {
+            const std::uint32_t next = MaxValue<std::uint32_t>(1, dim >> 1);
+            std::vector<std::uint8_t> smaller(static_cast<std::size_t>(next) * next * 4);
+            DownsampleRgbaLevel(build.mips.back().data(), dim, smaller.data(), next);
+            build.mips.push_back(std::move(smaller));
+            dim = next;
+        }
+
+        build.atlasSize = atlasSize;
+        build.cell = cell;
+        build.levels = levels;
+        build.rects = std::move(rects);
+        build.ok = true;
+    }
+
+    void MaybeStartSpriteAtlasWorker()
+    {
+        const std::uint64_t request = g_spriteAtlasRequest.load();
+        if (g_spriteAtlasStarted.load() == request)
+            return;
+        // Names tend to arrive in bursts (everyone joining at once): wait for a quiet
+        // moment so one build covers them all.
+        const DWORD requestTick = g_spriteAtlasRequestTick.load();
+        if (requestTick != 0 && GetTickCount() - requestTick < 250)
+            return;
+        if (g_spriteAtlasWorkerBusy.exchange(true))
+            return;
+        g_spriteAtlasStarted.store(request);
+
+        std::thread([request]()
+        {
+            BackgroundThreadScope scope;
+            auto build = std::make_unique<SpriteAtlasBuild>();
+            build->request = request;
+            BuildSpriteAtlasCpu(*build);
+            if (build->ok)
+            {
+                g_spriteAtlasFailures.store(0);
+                std::lock_guard<std::mutex> lock(g_spriteAtlasMutex);
+                g_pendingSpriteAtlas = std::move(build);
+            }
+            else
+            {
+                g_spriteAtlasFailures.fetch_add(1);
+            }
+            g_spriteAtlasWorkerBusy.store(false);
+        }).detach();
+    }
+
+    bool TryCreateGpuSpriteResourcesLocked(VulkanMinimapRenderer& renderer)
+    {
+        GpuTexturePipeline& gp = renderer.spriteGpu;
+        if (g_nameSpriteBuiltSize.load() != 0 && g_nameSpriteBuiltSize.load() != NameSpriteFontHeight())
+        {
+            g_nameSpriteBuiltSize.store(NameSpriteFontHeight());
+            RequestSpriteAtlasRebuild();
+        }
+
+        std::unique_ptr<SpriteAtlasBuild> build;
+        {
+            std::lock_guard<std::mutex> lock(g_spriteAtlasMutex);
+            build = std::move(g_pendingSpriteAtlas);
+        }
+
+        // A renderer rebuilt from scratch (resolution change, F10) has no sprite
+        // pipeline and nothing pending: ask for a fresh build once. Repeated worker
+        // failures stop the requests so a broken atlas cannot spin a thread forever.
+        if (build == nullptr && !gp.ready && !gp.attempted && !g_spriteAtlasWorkerBusy.load() &&
+            g_spriteAtlasStarted.load() == g_spriteAtlasRequest.load() && g_spriteAtlasFailures.load() < 3)
+        {
+            RequestSpriteAtlasRebuild();
+        }
+
+        if (CanStartGpuPipelineLocked(renderer))
+            MaybeStartSpriteAtlasWorker();
+        if (build == nullptr)
+            return gp.ready;
+        if (!CanStartGpuPipelineLocked(renderer))
+        {
+            // Renderer not up yet: keep the build for a later frame.
+            std::lock_guard<std::mutex> lock(g_spriteAtlasMutex);
+            if (g_pendingSpriteAtlas == nullptr)
+                g_pendingSpriteAtlas = std::move(build);
+            return gp.ready;
+        }
+
+        // Swap in the new atlas. The old one may still be referenced by submitted
+        // command buffers, so it is parked and destroyed a few frames later instead of
+        // stalling the device (vkDeviceWaitIdle races the game's own submitting
+        // threads and can lose the device).
+        if (gp.ready)
+        {
+            RetiredGpuPipeline retired{};
+            retired.gp = gp;
+            renderer.retiredPipelines.push_back(std::move(retired));
+            gp = GpuTexturePipeline{};
+        }
+        else
+        {
+            DestroyGpuTexturePipelineLocked(renderer, gp);
+        }
+        renderer.spriteRects.clear();
+        gp.attempted = true;
+
+        if (!TryCreateGpuTexturePipelineLocked(renderer, gp, MINIMAP_SPRITE_FRAGMENT_SHADER, build->mips.front().data(), build->atlasSize, build->levels, "sprites", false, &build->mips))
         {
             Log("[Minimap] using CPU icon fallback");
             return false;
         }
 
-        renderer.spriteRects = std::move(rects);
+        g_nameSpriteBuiltSize.store(build->fontHeight);
+        renderer.spriteRects = std::move(build->rects);
         std::ostringstream oss;
         oss << "[Minimap] GPU sprite renderer ready"
             << " | sprites=" << renderer.spriteRects.size()
-            << " | atlas=" << atlasSize << "x" << atlasSize
-            << " | cell=" << cell
-            << " | mip_levels=" << gp.mipLevels;
+            << " | atlas=" << build->atlasSize << "x" << build->atlasSize
+            << " | cell=" << build->cell
+            << " | mip_levels=" << gp.mipLevels
+            << " | built_off_thread=yes";
         Log(oss.str());
         return true;
     }
@@ -8206,10 +8615,14 @@ namespace
         if (image == nullptr || buffer == nullptr || gp.uploadRegions.empty())
             return;
 
+        // A re-upload must not overwrite the image while an earlier frame is still
+        // sampling it, so it waits on fragment-shader reads; the first upload has
+        // nothing to wait for.
+        const bool reupload = gp.uploadedOnce;
         VkImageMemoryBarrier toTransfer{};
-        toTransfer.srcAccessMask = 0;
+        toTransfer.srcAccessMask = reupload ? VK_ACCESS_SHADER_READ_BIT : 0;
         toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        toTransfer.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        toTransfer.oldLayout = reupload ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
         toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         toTransfer.image = image;
         toTransfer.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -8217,7 +8630,7 @@ namespace
         toTransfer.subresourceRange.layerCount = 1;
         renderer.fns.cmdPipelineBarrier(
             commandBuffer,
-            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            reupload ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
             VK_PIPELINE_STAGE_TRANSFER_BIT,
             0,
             0,
@@ -8257,6 +8670,7 @@ namespace
             &toShader);
 
         gp.uploadPending = false;
+        gp.uploadedOnce = true;
         // The staging buffer (hundreds of MB for an 8192 map) is freed the next time
         // this image index is recorded: by then its fence has been waited on, so the
         // upload submit is guaranteed to have finished.
@@ -8268,14 +8682,23 @@ namespace
     {
         RecordGpuTextureUploadIfNeeded(renderer, renderer.mapGpu, commandBuffer, imageIndex);
         RecordGpuTextureUploadIfNeeded(renderer, renderer.spriteGpu, commandBuffer, imageIndex);
+        RecordGpuTextureUploadIfNeeded(renderer, renderer.fogGpu, commandBuffer, imageIndex);
     }
 
     void ReleaseGpuMapStagingIfUploadedLocked(VulkanMinimapRenderer& renderer, std::uint32_t imageIndex)
     {
-        for (GpuTexturePipeline* gp : { &renderer.mapGpu, &renderer.spriteGpu })
+        for (GpuTexturePipeline* gp : { &renderer.mapGpu, &renderer.spriteGpu, &renderer.fogGpu })
         {
             if (gp->stagingReleasePending && gp->uploadImageIndex == imageIndex)
             {
+                if (gp->persistentStaging)
+                {
+                    // The upload recorded with this image has completed: the buffer may
+                    // be refilled again.
+                    gp->stagingReleasePending = false;
+                    gp->stagingBusy = false;
+                    continue;
+                }
                 ReleaseGpuTextureStagingLocked(renderer, *gp);
                 if (gp == &renderer.mapGpu && g_minimapMapGpuEnabled.load())
                     ReleaseRealMapCpuCopy();
@@ -8317,6 +8740,7 @@ namespace
     {
         DestroyGpuTexturePipelineLocked(renderer, renderer.mapGpu);
         DestroyGpuTexturePipelineLocked(renderer, renderer.spriteGpu);
+        DestroyGpuTexturePipelineLocked(renderer, renderer.fogGpu);
         for (RetiredGpuPipeline& retired : renderer.retiredPipelines)
             DestroyGpuTexturePipelineLocked(renderer, retired.gp);
         renderer.retiredPipelines.clear();
@@ -8385,6 +8809,167 @@ namespace
         renderer.fns.cmdDraw(commandBuffer, 6, 1, 0, 0);
         return true;
     }
+    // ---- fog of war ----
+    constexpr const char* MINIMAP_FOG_FRAGMENT_SHADER = "embervale_minimap_fog.frag.spv";
+    constexpr std::uint32_t FOG_TEXTURE_MAX_LEVELS = 3;
+
+    // Resamples the live grid into a square RGBA image in map-uv space (u = x / W,
+    // v = 1 - z / W with W = REAL_MAP_WORLD_SIZE), so the fog shader can reuse the map
+    // shader's push constants unchanged. With the shipped 10240-unit world and 8-unit
+    // cells this is a straight copy (1280 x 1280). The value goes into every channel.
+    bool BuildFogTextureFromGrid(std::vector<std::uint8_t>& rgba, std::uint32_t& outSize, std::uint64_t& outVersion)
+    {
+        std::lock_guard<std::mutex> lock(g_fogGridMutex);
+        const FogOfWarGrid& grid = g_fogGrid;
+        if (!grid.valid || grid.width == 0 || grid.height == 0 || grid.cells.size() < static_cast<std::size_t>(grid.width) * grid.height)
+            return false;
+
+        std::uint32_t size = MaxValue(grid.width, grid.height);
+        size = ClampValue<std::uint32_t>(size + (size & 1u), 64, 4096);
+        rgba.resize(static_cast<std::size_t>(size) * size * 4);
+
+        const bool direct = grid.width == size && grid.height == size &&
+            std::fabs(grid.sizeX - REAL_MAP_WORLD_SIZE) < 1.0f && std::fabs(grid.sizeZ - REAL_MAP_WORLD_SIZE) < 1.0f;
+        const float cellX = grid.sizeX / static_cast<float>(grid.width);
+        const float cellZ = grid.sizeZ / static_cast<float>(grid.height);
+        for (std::uint32_t j = 0; j < size; ++j)
+        {
+            std::uint32_t row = j;
+            if (!direct)
+            {
+                const float z = (1.0f - (static_cast<float>(j) + 0.5f) / static_cast<float>(size)) * REAL_MAP_WORLD_SIZE;
+                row = static_cast<std::uint32_t>(ClampValue(static_cast<int>((grid.sizeZ - z) / cellZ), 0, static_cast<int>(grid.height) - 1));
+            }
+            const std::uint8_t* src = grid.cells.data() + static_cast<std::size_t>(row) * grid.width;
+            std::uint8_t* dst = rgba.data() + static_cast<std::size_t>(j) * size * 4;
+            for (std::uint32_t i = 0; i < size; ++i)
+            {
+                std::uint32_t col = i;
+                if (!direct)
+                {
+                    const float x = (static_cast<float>(i) + 0.5f) / static_cast<float>(size) * REAL_MAP_WORLD_SIZE;
+                    col = static_cast<std::uint32_t>(ClampValue(static_cast<int>(x / cellX), 0, static_cast<int>(grid.width) - 1));
+                }
+                const std::uint8_t value = src[col];
+                dst[i * 4 + 0] = value;
+                dst[i * 4 + 1] = value;
+                dst[i * 4 + 2] = value;
+                dst[i * 4 + 3] = value;
+            }
+        }
+        outSize = size;
+        outVersion = grid.version;
+        return true;
+    }
+
+    bool TryCreateGpuFogResourcesLocked(VulkanMinimapRenderer& renderer)
+    {
+        GpuTexturePipeline& gp = renderer.fogGpu;
+        if (gp.ready || gp.attempted || g_minimapFogStrength.load() <= 0)
+            return gp.ready;
+        if (!CanStartGpuPipelineLocked(renderer))
+            return false;
+
+        std::vector<std::uint8_t> rgba;
+        std::uint32_t size = 0;
+        std::uint64_t version = 0;
+        if (!BuildFogTextureFromGrid(rgba, size, version))
+            return false;   // no grid yet (world still loading); try again next frame
+
+        gp.attempted = true;
+        if (!TryCreateGpuTexturePipelineLocked(renderer, gp, MINIMAP_FOG_FRAGMENT_SHADER, rgba.data(), size, FOG_TEXTURE_MAX_LEVELS, "fog", true))
+            return false;
+        gp.contentVersion = version;
+
+        std::ostringstream oss;
+        oss << "[Minimap] GPU fog of war ready"
+            << " | texture=" << size << "x" << size
+            << " | mip_levels=" << gp.mipLevels;
+        Log(oss.str());
+        return true;
+    }
+
+    // Refills the fog staging buffer when the grid changed and no upload is in flight.
+    void UpdateGpuFogIfNeededLocked(VulkanMinimapRenderer& renderer)
+    {
+        GpuTexturePipeline& gp = renderer.fogGpu;
+        if (!gp.ready || !gp.persistentStaging || gp.stagingMapped == nullptr || gp.stagingBusy || gp.uploadPending)
+            return;
+
+        std::uint64_t version = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_fogGridMutex);
+            version = g_fogGrid.version;
+        }
+        if (version == gp.contentVersion)
+            return;
+
+        static std::vector<std::uint8_t> rgba;   // render thread, under g_rendererMutex
+        std::uint32_t size = 0;
+        if (!BuildFogTextureFromGrid(rgba, size, version) || size != gp.size)
+        {
+            // The grid is gone (world left) or has another size: retire this texture and
+            // let it be rebuilt when the next grid arrives.
+            RetiredGpuPipeline retired{};
+            retired.gp = gp;
+            renderer.retiredPipelines.push_back(std::move(retired));
+            gp = GpuTexturePipeline{};
+            return;
+        }
+
+        WriteMipChainToStaging(gp.uploadRegions, gp.stagingMapped, rgba.data(), size);
+        gp.contentVersion = version;
+        gp.uploadPending = true;
+        gp.stagingBusy = true;
+    }
+
+    // Darkens the undiscovered part of the map. Same quad and push constants as the
+    // map draw; params.w carries the strength.
+    bool TryDrawFogGpu(VulkanMinimapRenderer& renderer, void* commandBuffer, int cx, int cy, int radius, float centerX, float centerZ, float unitsPerPixel, float headingRadians)
+    {
+        const GpuTexturePipeline& gp = renderer.fogGpu;
+        const int strengthPercent = g_minimapFogStrength.load();
+        if (strengthPercent <= 0 || !IsGpuPipelineDrawable(renderer, gp))
+            return false;
+
+        const int innerRadius = MaxValue(8, radius);
+        const float width = static_cast<float>(renderer.width);
+        const float height = static_cast<float>(renderer.height);
+        const float left = static_cast<float>(cx - innerRadius);
+        const float top = static_cast<float>(cy - innerRadius);
+        const float right = static_cast<float>(cx + innerRadius + 1);
+        const float bottom = static_cast<float>(cy + innerRadius + 1);
+        const float radiusPixels = static_cast<float>(innerRadius) + 0.5f;
+
+        const float push[16] = {
+            (left / width) * 2.0f - 1.0f,
+            (top / height) * 2.0f - 1.0f,
+            (right / width) * 2.0f - 1.0f,
+            (bottom / height) * 2.0f - 1.0f,
+            1.0f,
+            0.0f,
+            height / width,
+            width / height,
+            centerX / REAL_MAP_WORLD_SIZE,
+            1.0f - (centerZ / REAL_MAP_WORLD_SIZE),
+            (radiusPixels * unitsPerPixel) / REAL_MAP_WORLD_SIZE,
+            radiusPixels,
+            std::cos(headingRadians),
+            std::sin(headingRadians),
+            0.0f,
+            static_cast<float>(strengthPercent) / 100.0f
+        };
+
+        void* descriptorSet = reinterpret_cast<void*>(gp.descriptorSet);
+        void* pipelineLayout = reinterpret_cast<void*>(gp.pipelineLayout);
+        renderer.fns.cmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, reinterpret_cast<void*>(gp.pipeline));
+        renderer.boundPipeline = gp.pipeline;
+        renderer.fns.cmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+        renderer.boundDescriptorSet = gp.descriptorSet;
+        renderer.fns.cmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, MINIMAP_MAP_PUSH_BYTES, push);
+        renderer.fns.cmdDraw(commandBuffer, 6, 1, 0, 0);
+        return true;
+    }
     // ---- END GPU MAP RENDERER ----
 
     void DestroyVulkanMinimapRendererLocked()
@@ -8392,8 +8977,32 @@ namespace
         void* device = reinterpret_cast<void*>(g_renderer.device);
         const VulkanRendererFns fns = g_renderer.fns;
 
-        if (device != nullptr && fns.deviceWaitIdle != nullptr)
-            fns.deviceWaitIdle(device);
+        // Everything we are about to destroy is referenced only by our own command
+        // buffers, and each of those has a fence. Waiting on the fences is enough and,
+        // unlike vkDeviceWaitIdle, does not race the game's own submitting threads (a
+        // known way to lose the device). The device-wide wait stays as the fallback for
+        // a fence that never signals.
+        if (device != nullptr)
+        {
+            bool allSignaled = true;
+            if (fns.waitForFences != nullptr)
+            {
+                for (uintptr_t fenceHandle : g_renderer.commandFences)
+                {
+                    if (fenceHandle == 0)
+                        continue;
+                    void* fence = reinterpret_cast<void*>(fenceHandle);
+                    if (fns.waitForFences(device, 1, &fence, 1, 500000000ull) != VK_SUCCESS)
+                        allSignaled = false;
+                }
+            }
+            else
+            {
+                allSignaled = false;
+            }
+            if (!allSignaled && fns.deviceWaitIdle != nullptr)
+                fns.deviceWaitIdle(device);
+        }
 
         if (device != nullptr)
         {
@@ -9712,6 +10321,29 @@ namespace
 
     bool IsWorldPointRevealedByFogOfWar(float worldX, float worldZ)
     {
+        {
+            std::lock_guard<std::mutex> lock(g_fogGridMutex);
+            const FogOfWarGrid& grid = g_fogGrid;
+            if (grid.valid && grid.width > 0 && grid.height > 0 && grid.cells.size() >= static_cast<std::size_t>(grid.width) * grid.height)
+            {
+                const float cellX = grid.sizeX / static_cast<float>(grid.width);
+                const float cellZ = grid.sizeZ / static_cast<float>(grid.height);
+                const int baseX = ClampValue(static_cast<int>(worldX / cellX), 0, static_cast<int>(grid.width) - 1);
+                const int baseY = ClampValue(static_cast<int>((grid.sizeZ - worldZ) / cellZ), 0, static_cast<int>(grid.height) - 1);
+                std::uint8_t best = 0;
+                for (int dy = -1; dy <= 1; ++dy)
+                {
+                    const int y = ClampValue(baseY + dy, 0, static_cast<int>(grid.height) - 1);
+                    for (int dx = -1; dx <= 1; ++dx)
+                    {
+                        const int x = ClampValue(baseX + dx, 0, static_cast<int>(grid.width) - 1);
+                        best = MaxValue(best, grid.cells[static_cast<std::size_t>(y) * grid.width + static_cast<std::size_t>(x)]);
+                    }
+                }
+                return best >= 40;
+            }
+        }
+
         EnsureFogOfWarLoaded();
 
         std::lock_guard<std::mutex> lock(g_fogOfWarMutex);
@@ -10362,8 +10994,11 @@ namespace
     {
         __try
         {
-            g_iterInit(ctx, &record, static_cast<std::uint32_t>(sizeof(record)));
-            return g_iterNext(ctx, &record, static_cast<std::uint32_t>(sizeof(record)));
+            alignas(16) std::uint8_t scratch[ITER_RECORD_SCRATCH_BYTES] = {};
+            g_iterInit(ctx, scratch, static_cast<std::uint32_t>(sizeof(record)));
+            const bool ok = g_iterNext(ctx, scratch, static_cast<std::uint32_t>(sizeof(record)));
+            std::memcpy(&record, scratch, sizeof(record));
+            return ok;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -11007,7 +11642,11 @@ namespace
         {
             int expected = 0;
             if (g_sessionLayoutState.compare_exchange_strong(expected, 1))
-                std::thread(FindSessionPlayerLayout).detach();
+                std::thread([]()
+                {
+                    BackgroundThreadScope scope;
+                    FindSessionPlayerLayout();
+                }).detach();
             return;
         }
         if (layoutState != 2)
@@ -11580,13 +12219,15 @@ namespace
 
             for (const StaticPoi& poi : g_staticPois.pois)
             {
-                if (!IsWorldPointRevealedByFogOfWar(poi.x, poi.z))
-                    continue;
-
+                // Distance first: the fog lookup takes a mutex, and only the handful of
+                // POIs inside the minimap need it (not all 567, every frame).
                 const float dx = poi.x - centerX;
                 const float dz = poi.z - centerZ;
                 const float distanceSq = dx * dx + dz * dz;
                 if (distanceSq > radiusSq)
+                    continue;
+
+                if (!IsWorldPointRevealedByFogOfWar(poi.x, poi.z))
                     continue;
 
                 // The live master-marker feed already covers this spot with the real
@@ -12163,20 +12804,6 @@ namespace
         const float zoom = std::pow(1.32f, static_cast<float>(zoomStep));
         const float unitsPerPixel = MINIMAP_BASE_UNITS_PER_PIXEL / zoom;
 
-        // Nameplates are filled mid-frame and cleared at frame start; the render thread
-        // sees them at a different point than the UI hook does.
-        {
-            static DWORD lastRemotePlayerTick = 0;
-            const DWORD nowTick = GetTickCount();
-            const uintptr_t lockedState = g_lockedUiState.load();
-            if (lockedState != 0 && TicksSince(nowTick, g_lockedUiStateTick.load()) < UI_STATE_LOCK_TIMEOUT_MS &&
-                (lastRemotePlayerTick == 0 || nowTick - lastRemotePlayerTick >= 50))
-            {
-                lastRemotePlayerTick = nowTick;
-                TryCaptureRemotePlayers(reinterpret_cast<std::uint8_t*>(lockedState));
-            }
-        }
-
         const std::vector<CapturedWaypoint> waypoints = CopyWaypoints();
         const std::vector<CapturedNearbyMarker> nearbyMarkers = CopyNearbyMarkers();
         const std::vector<CapturedMapMarkerVisibility> visibleMapMarkers = CopyVisibleMapMarkers();
@@ -12284,6 +12911,7 @@ namespace
 
         if (!TryDrawRealMapGpu(renderer, commandBuffer, cx, cy, frameMapRadius, centerX, centerZ, unitsPerPixel, mapHeading))
             DrawRealMap(renderer, commandBuffer, cx, cy, frameMapRadius, centerX, centerZ, unitsPerPixel, mapHeading);
+        TryDrawFogGpu(renderer, commandBuffer, cx, cy, frameMapRadius, centerX, centerZ, unitsPerPixel, mapHeading);
 
         if (hasRasterFrame)
         {
@@ -12462,6 +13090,8 @@ namespace
         if (g_minimapMapGpuEnabled.load())
             TryCreateGpuMapResourcesLocked(g_renderer);
         TryCreateGpuSpriteResourcesLocked(g_renderer);
+        TryCreateGpuFogResourcesLocked(g_renderer);
+        UpdateGpuFogIfNeededLocked(g_renderer);
 
         VkCommandBufferBeginInfo beginInfo{};
         if (g_renderer.fns.beginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS)
@@ -12873,7 +13503,7 @@ namespace
             g_minimapTeardownPending.store(false);
             // Come back with a clean slate: the map image was dropped from RAM after its
             // upload, so let it reload, and rebuild the name-label atlas.
-            g_spriteAtlasRebuild.store(true);
+            RequestSpriteAtlasRebuild();
         }
 
         std::ostringstream oss;
@@ -12899,15 +13529,25 @@ namespace
         Log(oss.str());
     }
 
-    void UpdateMinimapRuntimeControls(ModContext* modContext)
+    std::mutex g_runtimeControlsMutex;
+
+    // Called from Shroudtopia's update thread and from the present hook. The two must
+    // not run this at the same time (the layout-edit state is plain data), and the
+    // config file is only re-read from the update thread so the render thread never
+    // touches disk.
+    void UpdateMinimapRuntimeControls(ModContext* modContext, bool allowConfigRefresh)
     {
+        std::unique_lock<std::mutex> lock(g_runtimeControlsMutex, std::try_to_lock);
+        if (!lock.owns_lock())
+            return;
+
         // The toggle key is the one thing that still runs while the mod is off.
         UpdateMinimapVisibilityHotkey();
         if (!g_minimapEnabled.load())
             return;
 
         const DWORD now = GetTickCount();
-        if (now - g_lastConfigPollTick >= MINIMAP_CONFIG_POLL_MS)
+        if (allowConfigRefresh && now - g_lastConfigPollTick >= MINIMAP_CONFIG_POLL_MS)
         {
             g_lastConfigPollTick = now;
             RefreshMinimapConfig(modContext);
@@ -13057,7 +13697,7 @@ namespace
 
     std::int32_t __fastcall HookQueuePresent(void* queue, const void* presentInfo)
     {
-        UpdateMinimapRuntimeControls(g_modContext);
+        UpdateMinimapRuntimeControls(g_modContext, false);
         if (g_minimapEnabled.load())
         {
             TryScanVulkanDeviceFunctions();
@@ -13320,6 +13960,7 @@ namespace
 
         std::thread([]()
         {
+            BackgroundThreadScope scope;
             const DWORD start = GetTickCount();
             const bool found = ScanForVulkanDeviceTable();
             if (g_debugLoggingEnabled.load())
@@ -13442,6 +14083,12 @@ namespace
             const uintptr_t mapMarkerVisibilityLoopRva = mapMarkerVisibilityRva != 0
                 ? mapMarkerVisibilityRva + (RVA_KNOWLEDGE_QUERY_MAPMARKER_VISIBILITY_LOOP - RVA_KNOWLEDGE_QUERY_MAPMARKER_VISIBILITY)
                 : 0;
+            const uintptr_t fogOfWarRva = ResolvePatternRvaNear(
+                RVA_FOG_OF_WAR,
+                g_fogOfWarExpected.data(),
+                g_fogOfWarExpected.size(),
+                "fog_of_war"
+            );
             const uintptr_t renderPresentFrameRva = ResolvePatternRvaNear(
                 RVA_RENDER_PRESENT_FRAME,
                 g_renderPresentFrameExpected.data(),
@@ -13511,9 +14158,17 @@ namespace
                 "player_waypoints_ui"
             );
 
-            g_mapMarkerVisibilityHook = InstallMapMarkerVisibilityLoopHook(
-                mapMarkerVisibilityLoopRva,
-                reinterpret_cast<void*>(&CaptureMapMarkerVisibilityRecordHook)
+            g_mapMarkerVisibilityHook = MARKER_VISIBILITY_HOOK_ENABLED
+                ? InstallMapMarkerVisibilityLoopHook(
+                    mapMarkerVisibilityLoopRva,
+                    reinterpret_cast<void*>(&CaptureMapMarkerVisibilityRecordHook))
+                : nullptr;
+
+            g_fogOfWarHook = InstallEntryHook(
+                fogOfWarRva,
+                g_fogOfWarExpected,
+                reinterpret_cast<void*>(&CaptureFogOfWarHook),
+                "fog_of_war"
             );
 
             g_renderPresentFrameHook = InstallEntryHook(
@@ -13536,6 +14191,7 @@ namespace
                 << " | ui_hook=" << (g_localPlayerUiRenderSetupHook != nullptr ? "ready" : "missing")
                 << " | waypoint_hook=" << (g_playerWaypointsUiHook != nullptr ? "ready" : "missing")
                 << " | marker_visibility_hook=" << (g_mapMarkerVisibilityHook != nullptr ? "ready" : "missing")
+                << " | fog_hook=" << (g_fogOfWarHook != nullptr ? "ready" : "missing")
                 << " | render_hook=" << (g_renderPresentFrameHook != nullptr ? "ready" : "missing")
                 << " | vulkan_probe=" << (g_vulkanDeviceTableInitHook != nullptr ? "ready" : "missing");
             modContext->Log(oss.str().c_str());
@@ -13544,6 +14200,13 @@ namespace
 
         void Unload(ModContext* modContext) override
         {
+            // Background workers read game memory through this DLL's code: they must be
+            // gone before anything is torn down. Every loop checks MinimapRuntimeActive().
+            g_shuttingDown.store(true);
+            g_minimapEnabled.store(false);
+            for (int waited = 0; waited < 100 && g_backgroundThreads.load() > 0; ++waited)
+                Sleep(20);
+
             {
                 std::lock_guard<std::mutex> lock(g_rendererMutex);
                 DestroyVulkanMinimapRendererLocked();
@@ -13569,6 +14232,13 @@ namespace
                 g_mapMarkerVisibilityHook->deactivate();
                 delete g_mapMarkerVisibilityHook;
                 g_mapMarkerVisibilityHook = nullptr;
+            }
+
+            if (g_fogOfWarHook != nullptr)
+            {
+                g_fogOfWarHook->deactivate();
+                delete g_fogOfWarHook;
+                g_fogOfWarHook = nullptr;
             }
 
             if (g_renderPresentFrameHook != nullptr)
@@ -13637,6 +14307,7 @@ namespace
             const bool uiOk = ActivateHook(g_localPlayerUiRenderSetupHook);
             const bool waypointOk = ActivateHook(g_playerWaypointsUiHook);
             const bool markerVisibilityOk = ActivateHook(g_mapMarkerVisibilityHook);
+            const bool fogOk = ActivateHook(g_fogOfWarHook);
             const bool renderOk = ActivateHook(g_renderPresentFrameHook);
             const bool vulkanOk = ActivateHook(g_vulkanDeviceTableInitHook);
             active = uiOk || waypointOk || markerVisibilityOk || renderOk || vulkanOk;
@@ -13648,6 +14319,7 @@ namespace
                 << " | ui_hook=" << HookActivationState(g_localPlayerUiRenderSetupHook)
                 << " | waypoint_hook=" << HookActivationState(g_playerWaypointsUiHook)
                 << " | marker_visibility_hook=" << HookActivationState(g_mapMarkerVisibilityHook)
+                << " | fog_hook=" << (fogOk ? "active" : HookActivationState(g_fogOfWarHook))
                 << " | render_hook=" << HookActivationState(g_renderPresentFrameHook)
                 << " | vulkan_probe=" << HookActivationState(g_vulkanDeviceTableInitHook)
                 << " | external_overlay=disabled";
@@ -13669,6 +14341,9 @@ namespace
 
             if (g_mapMarkerVisibilityHook != nullptr)
                 g_mapMarkerVisibilityHook->deactivate();
+
+            if (g_fogOfWarHook != nullptr)
+                g_fogOfWarHook->deactivate();
 
             if (g_renderPresentFrameHook != nullptr)
                 g_renderPresentFrameHook->deactivate();
@@ -13696,7 +14371,7 @@ namespace
         {
             if (active)
             {
-                UpdateMinimapRuntimeControls(modContext);
+                UpdateMinimapRuntimeControls(modContext, true);
                 PollGameSessionLog();
                 ProbeVulkanTable();
                 MaybeStartLivePositionTracker();
