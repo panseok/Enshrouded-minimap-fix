@@ -7,32 +7,44 @@ draws the minimap directly inside the Enshrouded frame.
 
 ## What It Does
 
-- Shows a minimap in the top-right corner of the screen.
+- Shows a square, north-up minimap in the top-right corner of the screen.
 - Press `Esc` and drag it anywhere; drag its bottom-right corner to resize.
-- Uses a premium compass-style frame asset.
-- Renders the real Embervale map at minimap scale.
-- Shows the player's position and facing direction.
-- Darkens the parts of the map you have not discovered yet, straight from the
-  game's own fog-of-war grid (the same data the world map uses), updated live
-  as you explore.
-- Uses real map marker icons extracted from the game's map UI.
-- Shows nearby points of interest that are visible or detected by the map.
-- Uses fog-of-war and POI data as a fallback when the game does not expose all
-  live markers.
+  The layout is saved and restored on the next start.
+- Thin, semi-transparent frame with N / E / S / W letters.
+- Renders the real Embervale map (8192x8192, drawn on the GPU) at minimap scale,
+  with the shroud zones tinted and outlined.
+- Covers the parts of the map you have not discovered yet with slate grey,
+  straight from the game's own fog-of-war grid (the same data the world map
+  uses), updated live as you explore. Map icons in undiscovered areas stay hidden.
+- Your own marker: a lime triangle pointing in your direction of travel, or a
+  lime dot with the view direction switched off (`F11`).
+- Other players as sky-blue dots with their names underneath.
+- Pings: the pinger's ping icon tinted green with their name under it. A ping
+  stays until that player pings somewhere else.
+- Waypoints: the game's waypoint icon, or, when the waypoint sits on another
+  map icon, a yellow outline that follows that icon's shape.
+- Pings and waypoints outside the minimap range are pinned to the rim.
+- Map markers (chests, altars, dungeons, ...) with the game's own icons, taken
+  from the same marker lists the world map draws, so only discovered markers
+  appear.
+- NPCs as the game's blue "person" icon.
 - Renders inside the game's Vulkan frame without a separate overlay window.
 
 ## Controls
 
 - `+` zooms in.
 - `-` zooms out.
-- `F10` fully enables/disables the mod. While it is off the game-thread hooks
+- `F10` turns the whole mod on/off. While it is off the game-thread hooks
   return immediately, the background trackers stop, nothing is recorded or
-  submitted in the present hook, and the Vulkan objects (map texture and sprite
-  atlas) are released. Pressing it again rebuilds everything.
-- `F11` turns the view direction on/off. Off: no heading work at all and your
-  own marker becomes a round lime dot. On: the lime triangle turns with you.
+  submitted in the present hook, and the Vulkan objects (map texture, fog
+  texture and sprite atlas) are released. Pressing it again rebuilds
+  everything (about a second while the map reloads).
+- `F11` turns the view direction on/off. Off: your own marker becomes a round
+  lime dot. On: the lime triangle turns with you.
+- `Esc` (game menu): drag the minimap to move it, drag its bottom-right corner
+  to resize it.
 
-The numpad `+`, `-`, and `*` keys also work.
+The numpad `+`, `-`, and `*` keys also work (`*` toggles like `F10`).
 
 ## Download
 
@@ -93,36 +105,45 @@ Example (every key is optional):
     "minimap_mod": {
       "active": true,
       "toggle_key": "F10",
+      "heading_toggle_key": "F11",
       "debug_logging": false,
       "map_follow": "center",
-      "max_icons": 64
+      "max_icons": 64,
+      "label_font_size": 17,
+      "fog_strength": 100,
+      "map_texture_size": 8192
     }
   }
 }
 ```
 
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `toggle_key` | `F10` | Turns the whole mod on/off. |
+| `heading_toggle_key` | `F11` | Turns the view direction on/off. |
+| `map_follow` | `center` | `center` keeps you in the middle and scrolls the map; `static` keeps the map still and moves your marker until it nears the rim. |
+| `max_icons` | `64` | Most map icons drawn at once (8-128). |
+| `label_font_size` | `17` | Height in pixels of the player and ping name labels (8-40). |
+| `fog_strength` | `100` | Opacity of the grey over undiscovered areas (0-100). `0` turns the fog off. |
+| `map_texture_size` | `8192` | `8192`, `4096`, `2048` or `1024`; see Map Renderer. |
+| `map_renderer` | `gpu` | `gpu` or `cpu`; see Map Renderer. |
+| `debug_logging` | `false` | Verbose diagnostics in `shroudtopia.log`. |
+
+Keys are read every second while the mod is active, so most changes apply
+without a restart.
+
 Position and size are not config values: press `Esc`, drag the minimap where you
 want it and drag its bottom-right corner to resize. The result is saved in
 `mods\minimap_mod\minimap_layout.txt`.
 
-The mod also reads `mods.minimap_mod.toggle_key` every second while active.
-Recommended value: `F10`. Supported readable values include `F1`-`F24`,
+Key names accepted by `toggle_key` / `heading_toggle_key`: `F1`-`F24`,
 `insert`, `delete`, `home`, `end`, `pageup`, `pagedown`, `backspace`, and
 `numpad-*`.
 
-The minimap is always north-up: the map, compass frame and markers never
-rotate. The player arrow points along the direction you travel, computed from
-the position feed at no cost (standing still keeps the last direction; turning
-the camera alone does not move it). `F11` switches it off, and your own marker
-becomes a round lime dot.
-
-`map_follow` (default `center`): `center` keeps the player arrow in the middle
-and scrolls the map. `static` keeps the map still and moves
-the arrow across it; when the arrow gets close to the rim the view glides back
-onto the player.
-
-The mod reads these values directly and refreshes them every second while active.
-If the minimap is not loaded yet, start or restart the game after changing it.
+The minimap is always north-up: the map, frame and markers never rotate. The
+player arrow points along the direction you travel, computed from the position
+feed at no cost (standing still keeps the last direction; turning the camera
+alone does not move it).
 
 ## Map Renderer
 
@@ -140,12 +161,6 @@ blurry and banded no matter how detailed the map image was.
   is box-filtered down to this size when it is loaded. `4096` cuts the map's
   VRAM from about 358 MB to 90 MB and is hard to tell apart at normal zoom.
   The CPU copy of the map is released as soon as the GPU upload has finished.
-- `label_font_size`: height in pixels of the player and ping name labels
-  (8-40, default 17).
-- `heading_toggle_key`: key for the view-direction toggle (default `F11`).
-- `fog_strength`: 0-100 (default 100), opacity of the slate grey covering
-  undiscovered map areas. 100 hides the terrain completely, like the world map.
-  `0` turns the fog overlay off.
 
 The map image is loaded in this order:
 
@@ -169,24 +184,39 @@ python tools\map-render\build_hd_map.py "D:\SteamLibrary\steamapps\common\Enshro
 The map shader is generated by `python tools\shaders\build_map_shader.py`
 (no glslang needed; the GLSL equivalent is documented in that script).
 
-### Square window
+### Square window and frame
 
 The minimap is a square window: the map shader, the CPU renderer, marker clipping
 and the player arrow all use the square boundary. `embervale_minimap_frame.rgba`
-is the square frame, generated from the original round frame with
-`python tools\map-render\make_square_frame.py <round.rgba> <square.rgba>`.
+is the thin frame with the N / E / S / W letters, generated with
+`python tools\map-render\make_clean_frame.py`; the original ornate frame is kept
+as `embervale_minimap_frame_ornate.rgba`.
 
-### Icons and player marker
+### Fog of war
+
+`embervale_minimap_fog.frag.spv` draws the undiscovered areas. The data is the
+game's own `FogOfWar` grid (one byte per 8 world units, 1280x1280 for the
+10240-unit world), copied from the running game twice a second and uploaded as
+a texture only when it changed. The shader is generated by
+`python tools\shaders\build_fog_shader.py`. Without the shader file the map is
+drawn without fog.
+
+### Icons, players and labels
 
 Map icons are the game's own map marker icons at full resolution (64/128 px),
 drawn on the GPU from a mipmapped sprite atlas (`embervale_minimap_sprite.frag.spv`)
-in their original colors. The player is a lime-green triangle pointing in the view
-direction; other players are sky-blue dots and NPCs yellow dots, all generated at
-runtime. Other players are recognized as moving world-map markers without a map
-icon; with `debug_logging` on, the log prints a `master marker census` every 15 s. Marker
-types that have no icon in the game's marker registry are not drawn (the world map
-does not draw them either). Without the sprite shader the icons fall back to a
-CPU rasterizer.
+in their original colors. Marker types that have no icon in the game's marker
+registry are not drawn (the world map does not draw them either). Without the
+sprite shader the icons fall back to a CPU rasterizer.
+
+Other players come from the session's player list (position and name); pings
+from the game's ping events; waypoints from each player's waypoint slot. Name
+labels are rendered with GDI (Segoe UI, white with a dark outline) into the same
+atlas. The atlas is rebuilt on a background thread whenever a new name shows
+up, so a player joining does not stall the frame.
+
+Waypoint outlines are silhouettes generated per icon at load time (the icon's
+alpha grown by a few pixels), drawn under the icon in yellow.
 
 `embervale_minimap_icons.bin` is built from a one-time export with
 `tools/eml-icon-exporter`:
@@ -265,6 +295,18 @@ Install to a custom Enshrouded path:
 - `assets/` - runtime assets copied next to the DLL.
 - `build-release.ps1` - builds `Release|x64`.
 - `install.ps1` - installs the mod and backs up the previous install.
+
+## Performance Notes
+
+- The mod adds one small `vkQueueSubmit` (a couple of quads and a few dozen
+  sprites) per frame. Its command buffer is only recorded when the previous
+  one for that swapchain image has finished; if the GPU is far behind, the
+  overlay is skipped for that frame instead of stalling the game.
+- Game-thread hooks read a few hundred bytes per frame; marker and player
+  lists are mirrored at 20 Hz, the fog grid at 2 Hz.
+- No memory scanning at runtime. The view direction is derived from the
+  position feed, so there is no camera search.
+- With the mod off (`F10`) nothing runs except the key check.
 
 ## Version
 
